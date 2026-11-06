@@ -90,6 +90,8 @@ WawLink 是基于 Kotlin Multiplatform、Compose Multiplatform 与 Material 3 �
 - **在线一键安装**：在应用内进入“容器”页，选择在线发行版（官方源或清华/阿里/中科大国内源），应用会自动拉取并部署。
 - **自定义导入**：也可以将自己预置的 `rootfs.tar.xz` 导入应用，支持完整备份与脱敏导入。
 
+功能调试器复用当前容器用户已有的 Bun：先查 `PATH`，再查 `${BUN_INSTALL:-$HOME/.bun}/bin/bun` 和 `/usr/local/bin/bun`，生成的 `wawlink-feature` 使用同一路径。新容器尚无 Bun 时暂缓安装，不弹辅助初始化错误、不写调试凭据；安装 Bun 后，下次进入功能页或启动 Agent 时可重试。不自动安装 Bun，不以此跳过 OMP 自身的安装检查；已发现的 Bun 无法执行、权限拒绝或文件冲突仍保留真实诊断。
+
 ### 3. 配置模型服务
 进入 **右上角菜单 → 模型服务** 或 **Agent 设置**：
 - 添加你的 LLM API 密钥（如 DeepSeek、OpenAI、Claude、Qwen 等兼容服务）。

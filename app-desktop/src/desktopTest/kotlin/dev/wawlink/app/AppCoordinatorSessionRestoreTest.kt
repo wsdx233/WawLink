@@ -32,24 +32,32 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 
-/** Exercises the coordinator with real durable journals and an unavailable container engine. */
+/** Durable journals and a real same-user file worker; native container engines remain unavailable. */
 class AppCoordinatorSessionRestoreTest {
     private class Fixture(count: Int, titleSource: SessionTitleSource? = null, journalOverride: String? = null) : AutoCloseable {
         val directory = Files.createTempDirectory("wawlink-lazy-sessions-").toFile()
         val ids = List(count) { "history-$it" }
         val containers = MutableStateFlow<List<ContainerInfo>>(emptyList())
         private val deployments = MutableStateFlow<List<DeploymentProgress>>(emptyList())
-        private val engineCalls = CopyOnWriteArrayList<String>()
-        private val configuration = ContainerConfig("fixture", "历史容器", File(directory, "rootfs").path)
-        private val runtime = Proxy.newProxyInstance(ContainerRuntime::class.java.classLoader, arrayOf(ContainerRuntime::class.java)) { _, method, _ ->
+        private val children = CopyOnWriteArrayList<Process>()
+        private val home = File(directory, "guest-home").apply { mkdirs() }
+        private val configuration = ContainerConfig("fixture", "历史容器", File(directory, "rootfs").path, environment = mapOf("HOME" to home.path))
+        private val runtime = Proxy.newProxyInstance(ContainerRuntime::class.java.classLoader, arrayOf(ContainerRuntime::class.java)) { _, method, args ->
             when (method.name) {
                 "getContainers" -> containers
                 "getDeployments" -> deployments
                 "close" -> Unit
-                else -> {
-                    engineCalls += method.name
-                    error("Unexpected engine API: ${method.name}")
+                "openProcess", "openRunningProcess" -> {
+                    @Suppress("UNCHECKED_CAST")
+                    val arguments = args[1] as List<String>
+                    check(arguments.take(2) == listOf("/usr/local/bin/bun", "-e")) { "Container engine is unavailable" }
+                    containers.value = containers.value.map { if (it.running) it else it.copy(running = true, runGeneration = it.runGeneration + 1) }
+                    ProcessBuilder("node", "--input-type=module", "-e", arguments[2]).apply {
+                        @Suppress("UNCHECKED_CAST")
+                        environment().putAll(args[3] as Map<String, String>)
+                    }.start().also(children::add)
                 }
+                else -> error("Unexpected engine API: ${method.name}")
             }
         } as ContainerRuntime
         var app: AppCoordinator
@@ -85,8 +93,11 @@ class AppCoordinatorSessionRestoreTest {
             beforeRestart()
             app = AppCoordinator(runtime, OmpProcessPool(runtime, directory), directory)
         }
-        fun assertNoEngineCalls() { assertTrue(engineCalls.isEmpty(), "Engine calls: $engineCalls") }
-        override fun close() { app.close(); directory.deleteRecursively() }
+        override fun close() {
+            app.close()
+            children.forEach { it.destroyForcibly(); it.waitFor() }
+            directory.deleteRecursively()
+        }
         private fun hash(id: String) = MessageDigest.getInstance("SHA-256").digest(id.toByteArray()).joinToString("") { "%02x".format(it) }
     }
 
@@ -107,7 +118,6 @@ class AppCoordinatorSessionRestoreTest {
                 assertFalse(fixture.driverMetadata(id).exists(), "Unopened session acquired driver metadata: $id")
                 assertEquals(originalJournals.getValue(id), fixture.journal(id).readText())
             }
-            fixture.assertNoEngineCalls()
         }
     }
 
@@ -303,7 +313,6 @@ class AppCoordinatorSessionRestoreTest {
             assertEquals(fixture.ids, fixture.metadata().getProperty("ids").split(','))
             fixture.app.leaveSession(created)
             assertFalse(fixture.app.hasSession(created))
-            fixture.assertNoEngineCalls()
         }
     }
 

@@ -2,15 +2,33 @@ package dev.wawlink.runtime
 
 import kotlinx.serialization.json.*
 
-/** Installed by the configured guest identity; root may reclaim checked host-created managed paths. */
-internal suspend fun installFeatureDebugClient(runtime: ContainerRuntime, containerId: String, endpoint: JsonObject) {
+/** Returns false only when Bun is absent; real execution and installation failures still throw. */
+internal suspend fun installFeatureDebugClient(runtime: ContainerRuntime, containerId: String, endpoint: JsonObject): Boolean = withFeatureOperation(runtime, containerId) {
+    val bun = featureCommand(runtime, containerId, """
+        # wawlink-feature-debug-bun
+        set -eu
+        bun=${'$'}(command -v bun 2>/dev/null) || bun=''
+        if [ -z "${'$'}bun" ]; then
+            for candidate in "${'$'}{BUN_INSTALL:-${'$'}HOME/.bun}/bin/bun" /usr/local/bin/bun; do
+                if [ -e "${'$'}candidate" ] || [ -L "${'$'}candidate" ]; then bun=${'$'}candidate; break; fi
+            done
+        fi
+        if [ -n "${'$'}bun" ]; then
+            case "${'$'}bun" in /*) ;; *) bun="${'$'}PWD/${'$'}bun";; esac
+            printf '%s' "${'$'}bun"
+        fi
+    """.trimIndent(), runningOnly = true).toString(Charsets.UTF_8)
+    if (bun.isEmpty()) return@withFeatureOperation false
+    // A shell/JS launcher also supports runtime paths containing spaces or quotes.
+    val client = "#!/bin/sh\n':' //; exec ${shellQuote(bun)} \"\$0\" \"\$@\"\n" + FEATURE_DEBUG_CLIENT
     val payload = buildJsonObject {
         put("endpoint", endpoint)
-        put("client", FEATURE_DEBUG_CLIENT)
+        put("client", client)
     }.toString().toByteArray()
     featureCommand(runtime, containerId,
-        "exec /usr/local/bin/bun -e " + shellQuote(FEATURE_DEBUG_INSTALL),
+        "exec " + shellQuote(bun) + " -e " + shellQuote(FEATURE_DEBUG_INSTALL),
         runningOnly = true, stdinBytes = payload)
+    true
 }
 
 private const val FEATURE_DEBUG_INSTALL = """
@@ -149,8 +167,7 @@ try {
 }
 """
 
-private const val FEATURE_DEBUG_CLIENT = """#!/usr/local/bin/bun
-'use strict';
+private const val FEATURE_DEBUG_CLIENT = """'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
 const MAX_RESPONSE = 32 * 1024 * 1024;

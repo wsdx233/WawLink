@@ -942,6 +942,41 @@ class OmpPromptDeliveryTest {
         }
     }
 
+    @Test fun missingDebuggerRuntimeDoesNotBlockAvailableNativeChatOrConfiguration() = runBlocking {
+        fixture(withManagement = true) {
+            managementTransport.respondManagement(managementCatalogue(), nativeDefault)
+            awaitState { !it.modelLoading }
+            bunAvailable = false
+            val features = featureService()
+            withTimeout(5_000) { featureDiscoveryStarted.await() }
+            val catalog = features.catalog("fixture")
+            assertTrue(catalog.errors.isEmpty())
+            assertTrue(File(directory, "home/.omp/agent/skills/wawlink-functions/SKILL.md").isFile)
+
+            gate.complete(transport)
+            controller.sendPrompt("调试器未就绪不阻断原生会话")
+            val request = transport.request()
+            transport.acceptUser(request)
+            transport.respond(request)
+            transport.finish(request)
+            val completed = awaitState { it.status == SessionStatus.DONE }
+            assertEquals(listOf("调试器未就绪不阻断原生会话"), completed.feed.filterIsInstance<UserMessageItem>().map { it.text })
+            assertNull(completed.error)
+            val management = pool.management("fixture", "/workspace")
+            val reload = async { management.reload() }
+            managementTransport.respondManagement(managementTransport.managementRequest("snapshot"), JsonObject(emptyMap()))
+            managementTransport.respondManagement(managementTransport.managementRequest("modelsSnapshot"), nativeDefault)
+            reload.await()
+            assertFalse(management.state.value.loading)
+            assertNull(management.state.value.error)
+            assertNull(management.state.value.modelsError)
+            assertEquals("resolved", management.state.value.models.single().id)
+            assertTrue(features.errors.value["fixture"].orEmpty().isEmpty())
+            assertTrue(pool.runtimeIssues.value.isEmpty())
+            assertFalse(File(directory, "home/.wawlink/feature-debug/endpoint.json").exists())
+        }
+    }
+
     @Test fun optionalSkillAndDebuggerFailuresRemainDiscoverableWithoutBlockingChatOrConfiguration() = runBlocking {
         for ((skillFailure, debugFailure) in listOf(true to false, false to true, true to true)) {
             fixture(withManagement = true) {
@@ -1333,6 +1368,12 @@ class OmpPromptDeliveryTest {
         val skillInstallStarted = CompletableDeferred<Unit>()
         @Volatile var skillInstallFailure: String? = null
         @Volatile var debugInstallFailure: String? = null
+        @Volatile var bunAvailable = true
+        private val bunWrapper = File(directory, "fixture-bin/bun").apply {
+            parentFile.mkdirs()
+            writeText("#!/bin/sh\nexec node \"\$@\"\n")
+            check(setExecutable(true))
+        }
         val debugInstallStarts = AtomicInteger()
         val featureDiscoveryStarted = CompletableDeferred<Unit>()
         private var features: ContainerFeatureService? = null
@@ -1362,7 +1403,10 @@ class OmpPromptDeliveryTest {
                 }
                 // Bootstrap is a real short-lived shell process, not the chat transport.
                 if (arguments.firstOrNull() == "/bin/sh" && arguments.getOrNull(1) == "-c") {
-                    val debugger = arguments.last().startsWith("exec /usr/local/bin/bun -e ")
+                    if (arguments.last().startsWith("# wawlink-feature-debug-bun\n")) {
+                        return FinishedProcess(if (bunAvailable) bunWrapper.absolutePath else "")
+                    }
+                    val debugger = arguments.last().startsWith("exec ") && arguments.last().contains(" -e ")
                     if (debugger) {
                         debugInstallStarts.incrementAndGet()
                         debugInstallFailure?.let { return FinishedProcess("", status = 1, error = it) }
@@ -1370,13 +1414,12 @@ class OmpPromptDeliveryTest {
                         skillInstallFailure?.let { return FinishedProcess("", status = 1, error = it) }
                     }
                     if (!debugger && arguments.last().contains(".wawlink/features")) featureDiscoveryStarted.complete(Unit)
-                    skillInstallGate?.let { blocked ->
+                    (if (!debugger) skillInstallGate else null)?.let { blocked ->
                         skillInstallStarted.complete(Unit)
                         return blocked.await()
                     }
                     val home = File(directory, "home").apply { mkdirs() }
-                    val command = if (debugger) arguments.dropLast(1) + arguments.last().replaceFirst("/usr/local/bin/bun", "node") else arguments
-                    return ProcessBuilder(command).directory(directory).apply {
+                    return ProcessBuilder(arguments).directory(directory).apply {
                         environment().clear()
                         environment().putAll(environment)
                         environment()["PATH"] = System.getenv("PATH")

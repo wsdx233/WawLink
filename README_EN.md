@@ -90,6 +90,8 @@ Grab the latest release APK (Android) or desktop build from [Releases](https://g
 - **Online Setup**: Go to the "Containers" tab, pick an online Linux distro (Official or Tsinghua/Ali/USTC mirrors), and let WawLink download and install it.
 - **Custom Import**: Or import your own `rootfs.tar.xz` archive with full or sanitized export options.
 
+The feature debugger reuses Bun for the current guest user: it checks `PATH`, then `${BUN_INSTALL:-$HOME/.bun}/bin/bun` and `/usr/local/bin/bun`, and generates `wawlink-feature` with the same runtime path. If a new container has no Bun yet, setup is deferred without an auxiliary-initialization error or debugger credentials; it can retry on the next Functions visit or Agent startup after Bun is installed. This neither installs Bun automatically nor bypasses OMP's own installation checks. A discovered runtime that cannot execute, permission denials, and file conflicts retain their actual diagnostics.
+
 ### 3. Configure Model Providers
 Open **Top-right menu → Model Providers** or **Agent Settings**:
 - Add your LLM API keys (DeepSeek, OpenAI, Claude, Qwen, etc.).

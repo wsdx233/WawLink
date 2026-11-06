@@ -100,13 +100,16 @@ class ContainerFeatureDebugger internal constructor(
             endpoints[containerId]?.takeIf { it.generation == container.runGeneration }?.let { return@withLock }
             FeatureDebugEndpoint(containerId, container.runGeneration, ::request).also { endpoints[containerId] = it }
         }
+        var installed = false
         try {
-            installFeatureDebugClient(runtime, containerId, endpoint.configuration())
+            val available = installFeatureDebugClient(runtime, containerId, endpoint.configuration())
             requireCurrent(containerId, container.runGeneration)
-        } catch (failure: Throwable) {
-            synchronized(gate) { if (endpoints[containerId] === endpoint) endpoints.remove(containerId) }
-            endpoint.close()
-            throw failure
+            installed = available
+        } finally {
+            if (!installed) {
+                synchronized(gate) { if (endpoints[containerId] === endpoint) endpoints.remove(containerId) }
+                endpoint.close()
+            }
         }
     }
 

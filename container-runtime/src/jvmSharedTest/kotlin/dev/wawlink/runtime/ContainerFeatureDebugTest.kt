@@ -7,6 +7,7 @@ import java.net.URI
 import java.nio.file.Files
 import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
@@ -138,6 +139,7 @@ class ContainerFeatureDebugTest {
         hostGid: Int = gid,
         mapped: Boolean = false,
         chownError: String? = null,
+        bunPresent: Boolean = true,
     ) : AutoCloseable {
         val root = Files.createTempDirectory("wawlink-debug-owner-").toFile()
         val home = File(root, "guest home '中文").apply { mkdir() }
@@ -156,6 +158,18 @@ class ContainerFeatureDebugTest {
             }.toString())
         }
         private val preload = File(root, "ownership.cjs").apply { writeText(OWNERSHIP_PRELOAD) }
+        val runtimeBin = File(root, "runtime bin '中文").apply { mkdir() }
+        val bun = File(runtimeBin, "bun")
+        val legacyBun = File(root, "usr/local/bin/bun")
+        var path = runtimeBin.path
+        var bunInstall: String? = null
+        var onProbeStarted: (() -> Unit)? = null
+        init { if (bunPresent) writeBun(bun) }
+        fun writeBun(target: File) {
+            target.parentFile.mkdirs()
+            target.writeText("#!/bin/sh\nexec ${shellQuote(NODE_EXECUTABLE)} --require ${shellQuote(preload.path)} \"\$@\"\n")
+            check(target.setExecutable(true, true))
+        }
         private val containers = MutableStateFlow(listOf(ContainerInfo(ContainerConfig("container", "Test", root.path), running = true, runGeneration = 4)))
         private val runtime = Proxy.newProxyInstance(ContainerRuntime::class.java.classLoader, arrayOf(ContainerRuntime::class.java)) { _, method, args ->
             if (method.name == "getContainers") return@newProxyInstance containers
@@ -163,28 +177,34 @@ class ContainerFeatureDebugTest {
             check(args[0] == "container" && args[2] == "/")
             @Suppress("UNCHECKED_CAST")
             val command = args[1] as List<String>
-            // Keep the exact production script/payload, substituting only the host JS executable.
-            val actual = command.dropLast(1) + command.last().replaceFirst("/usr/local/bin/bun", "node --require " + shellQuote(preload.path))
+            // Map only the guest's conventional fallback path in the discovery probe.
+            val probe = command.last().startsWith("# wawlink-feature-debug-bun\n")
+            val actual = if (probe) command.dropLast(1) + command.last().replace("/usr/local/bin/bun", shellQuote(legacyBun.path)) else command
             ProcessBuilder(actual).directory(root).apply {
+                environment().clear()
                 @Suppress("UNCHECKED_CAST")
                 environment().putAll(args[3] as Map<String, String>)
                 environment()["HOME"] = home.path
+                environment()["PATH"] = path
+                bunInstall?.let { environment()["BUN_INSTALL"] = it }
                 environment()["WAWLINK_TEST_IDENTITY"] = identity.path
-                environment().remove("WAWLINK_MAPPED_HOST_UID")
-                environment().remove("WAWLINK_MAPPED_HOST_GID")
                 if (mapped) {
                     environment()["WAWLINK_MAPPED_HOST_UID"] = hostUid.toString()
                     environment()["WAWLINK_MAPPED_HOST_GID"] = hostGid.toString()
                 }
-            }.start()
+            }.start().also { if (probe) onProbeStarted?.invoke() }
         } as ContainerRuntime
         private val debugger = ContainerFeatureDebugger(runtime, {
             ContainerFeatureCatalog(home.path, listOf(ContainerFeature("demo", "Demo", "Description", "terminal", File(directory, "features/demo").path)), emptyList())
         }, { _, _ -> ContainerFeatureState(output = "service output") })
         private val endpoint = FeatureDebugEndpoint("container", 4, debugger::request)
         suspend fun install() = installFeatureDebugClient(runtime, "container", endpoint.configuration())
+        suspend fun ensureInstalled() = debugger.ensureInstalled("container")
+        fun interrupt(restart: Boolean) {
+            containers.value = containers.value.map { it.copy(running = restart, stopGeneration = it.stopGeneration + 1, runGeneration = it.runGeneration + 1) }
+        }
         suspend fun client(vararg arguments: String): JsonObject = Json.parseToJsonElement(featureCommand(runtime, "container",
-            "exec /usr/local/bin/bun " + shellQuote(executable.path) + arguments.joinToString("") { " " + shellQuote(it) },
+            "exec " + shellQuote(executable.path) + arguments.joinToString("") { " " + shellQuote(it) },
             runningOnly = true).toString(Charsets.UTF_8)).jsonObject
         private fun key(file: File): String = listOf("dev", "ino").joinToString(":") {
             (Files.getAttribute(file.toPath(), "unix:$it", NOFOLLOW_LINKS) as Number).toLong().toString()
@@ -213,6 +233,76 @@ class ContainerFeatureDebugTest {
             Files.setAttribute(file.toPath(), "unix:mode", mode)
         }
         override fun close() { endpoint.close(); debugger.close(); root.deleteRecursively() }
+    }
+
+    @Test fun missingBunLeavesNoInstallationAndCanRetryWithinTheSameRunningGeneration() = runBlocking {
+        ClientFixture(bunPresent = false).use { f ->
+            f.ensureInstalled()
+            assertFalse(f.directory.exists(), "Missing Bun must not publish credentials or a broken CLI")
+            f.writeBun(f.bun)
+            f.ensureInstalled()
+            assertEquals("service output", f.client("logs", "demo").getValue("output").jsonPrimitive.content)
+        }
+    }
+
+    @Test fun stopOrFastRestartDuringRuntimeDiscoveryCannotInstallIntoTheNextGeneration() = runBlocking {
+        for (restart in listOf(false, true)) ClientFixture().use { f ->
+            f.onProbeStarted = { f.interrupt(restart) }
+            assertFailsWith<CancellationException> { f.ensureInstalled() }
+            assertFalse(f.directory.exists(), "Stale discovery must not install credentials or the CLI")
+            if (restart) {
+                f.onProbeStarted = null
+                f.ensureInstalled()
+                assertEquals("service output", f.client("logs", "demo").getValue("output").jsonPrimitive.content)
+            }
+        }
+    }
+
+    @Test fun installedClientUsesTheDiscoveredRuntimeEvenWhenItIsOutsidePath() = runBlocking {
+        for (location in listOf("home", "configured", "legacy")) ClientFixture(bunPresent = false).use { f ->
+            val target = when (location) {
+                "home" -> File(f.home, ".bun/bin/bun")
+                "configured" -> File(f.root, "custom runtime '中文/bin/bun").also { f.bunInstall = it.parentFile.parent }
+                else -> f.legacyBun
+            }
+            f.writeBun(target)
+            assertTrue(f.install(), location)
+            val response = f.client("list", "--surface", "page")
+            assertEquals("page", response.getValue("surface").jsonPrimitive.content, location)
+            assertEquals("demo", response.getValue("features").jsonArray.single().jsonObject.getValue("featureId").jsonPrimitive.content, location)
+        }
+    }
+
+    @Test fun pathRuntimeTakesPrecedenceAndManagedClientCanMoveToANewRuntime() = runBlocking {
+        ClientFixture().use { f ->
+            f.legacyBun.parentFile.mkdirs()
+            f.legacyBun.writeText("#!/bin/sh\nexit 91\n")
+            check(f.legacyBun.setExecutable(true, true))
+            assertTrue(f.install())
+            assertEquals("service output", f.client("logs", "demo").getValue("output").jsonPrimitive.content)
+            val replacement = File(f.home, ".bun/bin/bun")
+            replacement.parentFile.mkdirs()
+            Files.move(f.bun.toPath(), replacement.toPath())
+            assertTrue(f.install())
+            assertEquals("service output", f.client("logs", "demo").getValue("output").jsonPrimitive.content)
+        }
+    }
+
+    @Test fun existingBrokenRuntimeRemainsAnExecutionFailureInsteadOfMissingBun() = runBlocking {
+        for ((script, status, executable) in listOf(
+            Triple("#!/no/such/bun-loader\n", 127, true),
+            Triple("#!/bin/sh\nexit 0\n", 126, false),
+            Triple("#!/bin/sh\nprintf 'Bun runtime failed: EIO' >&2\nexit 23\n", 23, true),
+        )) ClientFixture(bunPresent = false).use { f ->
+            val runtime = File(f.home, ".bun/bin/bun")
+            runtime.parentFile.mkdirs()
+            runtime.writeText(script)
+            check(runtime.setExecutable(executable, true))
+            val failure = assertFailsWith<IllegalStateException> { f.install() }
+            assertTrue(failure.message.orEmpty().contains("（$status）"), failure.message)
+            if (status == 23) assertTrue(failure.message.orEmpty().contains("Bun runtime failed: EIO"))
+            assertFalse(f.directory.exists())
+        }
     }
 
     @Test fun mappedRootAndNonrootInstallAndRunWhenOwnershipSyscallsAreUnsupported() = runBlocking {
@@ -497,6 +587,12 @@ class ContainerFeatureDebugTest {
         }
     }
     private companion object {
+        val NODE_EXECUTABLE: String by lazy {
+            val process = ProcessBuilder("node", "-p", "process.execPath").start()
+            val executable = process.inputStream.bufferedReader().use { it.readText().trim() }
+            check(process.waitFor() == 0 && File(executable).isFile) { "Node executable is unavailable" }
+            executable
+        }
         // Ownership simulation, not a privileged/chroot test: real filesystem types, links, modes,
         // production JS, processes and authenticated HTTP remain untouched.
         const val OWNERSHIP_PRELOAD = """
