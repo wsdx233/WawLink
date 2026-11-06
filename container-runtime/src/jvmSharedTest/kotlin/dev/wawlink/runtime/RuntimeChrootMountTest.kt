@@ -74,6 +74,7 @@ class RuntimeChrootMountTest {
         var confirmReadOnly = true
         var uid = "0"
         var busyTarget = ""
+        var namespace = ""
         val config = ContainerConfig(
             "chroot-mount-test", "Chroot", root.path, arch = System.getProperty("os.arch"),
             engine = ContainerEngineType.CHROOT, shell = "/bin/sh",
@@ -85,10 +86,13 @@ class RuntimeChrootMountTest {
                 put("MOCK_STATE", state.path)
                 put("MOCK_LOG", log.path)
                 put("MOCK_TARGET", target.path)
+                put("MOCK_DEV_TARGET", File(root, "dev").path)
+                put("MOCK_STORAGE_TARGET", sdcard.path)
                 put("MOCK_FAILURE", failure)
                 put("MOCK_RO", if (confirmReadOnly) "ro" else "rw")
                 put("MOCK_UID", uid)
                 put("MOCK_BUSY", busyTarget)
+                put("MOCK_NAMESPACE", namespace)
                 put("MOCK_MOUNTINFO", mounts().joinToString("\n") { entry ->
                     val path = File(entry, "target").readText().trimEnd('\n')
                         .replace("\\", "\\134").replace(" ", "\\040")
@@ -267,19 +271,14 @@ class RuntimeChrootMountTest {
             engines.prepare(config)
             assertFalse(File(root, "usr/local/bin/host-exec").exists())
             assertFalse(sdcard.exists())
-            val calls = calls("mount")
-            assertEquals(listOf(
-                listOf("mount", "-t", "proc", "proc", File(root, "proc").path),
-                listOf("mount", "-t", "sysfs", "sysfs", File(root, "sys").path),
-                listOf("mount", "-o", "bind", "/dev", File(root, "dev").path),
-                listOf("mount", "-t", "devpts", "devpts", File(root, "dev/pts").path),
-                listOf("mount", "-o", "bind", source.canonicalPath, target.canonicalPath),
-                listOf("mount", "-o", "remount,bind,ro", source.canonicalPath, target.canonicalPath),
-            ), calls.filter { it.getOrNull(1) != "--make-private" })
-            assertEquals(5, calls.count { it.getOrNull(1) == "--make-private" })
-            val before = calls.size
+            val binding = mounts().single { File(it, "target").readText().trimEnd('\n') == target.path }
+            assertEquals(source.canonicalPath, File(binding, "source").readText().trimEnd('\n'))
+            assertEquals("ro", File(binding, "options").readText().trim())
+            val before = mountedTargets()
+            val mountCount = mounts().size
             engines.prepare(config)
-            assertEquals(before, calls("mount").size, "重复 prepare 不得重复挂载")
+            assertEquals(before, mountedTargets())
+            assertEquals(mountCount, mounts().size, "重复 prepare 不得叠加挂载")
             engines.unmount(config.id)
             assertRolledBack("mnt/${target.name}", "dev/pts", "dev", "sys", "proc")
         }
@@ -447,6 +446,101 @@ class RuntimeChrootMountTest {
         }
     }
 
+    @Test fun lateDeviceSubmountsAreRemovedBeforeDevWithoutTouchingHostOrNeighbors() = fixture { fixture ->
+        with(fixture) {
+            val host = File(directory, "host dev")
+            val neighbor = File(root, "dev-neighbor")
+            addMount(host)
+            addMount(neighbor)
+            engines.prepare(config)
+            val parent = File(root, "dev/socket")
+            val child = File(parent, "late ' child \\ path")
+            addMount(parent)
+            addMount(child)
+            engines.unmount(config.id)
+            assertEquals(setOf(host.path, neighbor.path), mountedTargets())
+            val order = unmountedTargets()
+            assertTrue(order.indexOf(child.path) < order.indexOf(parent.path))
+            assertTrue(order.indexOf(parent.path) < order.indexOf(File(root, "dev").path))
+            assertFalse(host.path in order)
+            assertFalse(neighbor.path in order)
+        }
+    }
+
+    @Test fun busyPtsRetainsDevAndDoesNotAttemptParentUntilRetry() = fixture { fixture ->
+        with(fixture) {
+            engines.prepare(config)
+            busyTarget = File(root, "dev/pts").path
+            val error = assertFails { engines.unmount(config.id) }
+            assertTrue("target busy" in error.message.orEmpty())
+            assertEquals(setOf(busyTarget, File(root, "dev").path), mountedTargets())
+            assertFalse(File(root, "dev").path in unmountedTargets())
+            assertTrue(engines.hasOwnedMounts(config.id))
+            busyTarget = ""
+            engines.unmount(config.id)
+            assertTrue(mounts().isEmpty())
+            assertFalse(engines.hasOwnedMounts(config.id))
+        }
+    }
+
+    @Test fun devicePropagationFailureNeverAttachesPtsAndPreservesDevForSafeRetry() = fixture { fixture ->
+        with(fixture) {
+            failure = "dev-private"
+            val error = assertFails { engines.prepare(config) }
+            assertTrue("recursive propagation isolation denied" in error.message.orEmpty())
+            assertEquals(setOf(File(root, "dev").path), mountedTargets())
+            assertFalse(calls("mount").any { it.lastOrNull() == File(root, "dev/pts").path })
+            assertFalse(File(root, "dev").path in unmountedTargets())
+            failure = ""
+            engines.unmount(config.id)
+            assertTrue(mounts().isEmpty())
+        }
+    }
+
+    @Test fun unexpectedCustomSubmountsAndStackedMountsAreActuallyRemoved() = fixture { fixture ->
+        with(fixture) {
+            engines.prepare(config)
+            val child = File(target, "dynamic mount")
+            addMount(child)
+            addMount(child)
+            engines.unmount(config.id)
+            assertTrue(mounts().isEmpty())
+            assertEquals(2, unmountedTargets().count { it == child.path })
+            assertFalse(engines.hasOwnedMounts(config.id))
+        }
+    }
+
+    @Test fun changedSuNamespaceCannotForgetOrUnmountOriginalMounts() = fixture { fixture ->
+        with(fixture) {
+            engines.prepare(config)
+            val original = mountedTargets()
+            namespace = "mnt:[0]"
+            val error = assertFails { engines.unmount(config.id) }
+            assertTrue("挂载命名空间已改变" in error.message.orEmpty())
+            assertEquals(original, mountedTargets())
+            assertTrue(unmountedTargets().isEmpty())
+            assertTrue(engines.hasOwnedMounts(config.id))
+            namespace = ""
+            engines.unmount(config.id)
+            assertTrue(mounts().isEmpty())
+        }
+    }
+
+    @Test fun guestLauncherRejectsChangedNamespaceBeforePidHandshakeOrChroot() = fixture(android = false) { fixture ->
+        with(fixture) {
+            engines.prepare(config)
+            val handshake = File(directory, "guest.pid")
+            val launcher = engines.builder(config, listOf("/bin/sh"), "/", emptyMap(), true, handshake)
+            namespace = "mnt:[0]"
+            val error = assertFails { engines.rootCommand(launcher.command().last()) }
+            assertTrue("挂载命名空间已改变" in error.message.orEmpty())
+            assertFalse(handshake.exists())
+            assertFalse("test must never execute chroot" in error.message.orEmpty())
+            namespace = ""
+            engines.unmount(config.id)
+        }
+    }
+
     @Test fun ordinaryUnmountFailureAlsoRetainsOwnershipForRetry() = fixture { fixture ->
         with(fixture) {
             engines.prepare(config)
@@ -538,7 +632,6 @@ class RuntimeChrootMountTest {
             confirmReadOnly = false
             val error = assertFailsWith<IllegalArgumentException> { engines.prepare(config) }
             assertEquals("内核未确认只读绑定挂载：$target", error.message)
-            assertEquals(1, calls("cat").size)
             assertRolledBack("mnt/${target.name}", "dev/pts", "dev", "sys", "proc")
         }
     }
@@ -868,13 +961,20 @@ class RuntimeChrootMountTest {
                     *) command id "${'$'}@";;
                 esac
             }
+            readlink() {
+                if [ "${'$'}{1-}" = /proc/self/ns/mnt ] && [ -n "${'$'}MOCK_NAMESPACE" ]; then
+                    printf '%s\n' "${'$'}MOCK_NAMESPACE"
+                else command readlink "${'$'}@"; fi
+            }
             mountpoint() { [ "${'$'}#" = 2 ] && [ "${'$'}1" = -q ] && find_mount "${'$'}2"; }
             chroot() { echo 'test must never execute chroot' >&2; return 99; }
             mount() {
                 record mount "${'$'}@"
                 if [ "${'$'}1" = --make-private ] || [ "${'$'}1" = --make-rprivate ]; then
                     [ "${'$'}#" = 2 ] || return 64
-                    if [ "${'$'}MOCK_FAILURE" = private ] || { [ "${'$'}MOCK_FAILURE" = recursive-private ] && [ "${'$'}1" = --make-rprivate ]; }; then
+                    if [ "${'$'}MOCK_FAILURE" = private ] || { [ "${'$'}1" = --make-rprivate ] &&
+                        { { [ "${'$'}MOCK_FAILURE" = recursive-private ] && [ "${'$'}2" = "${'$'}MOCK_STORAGE_TARGET" ]; } ||
+                          { [ "${'$'}MOCK_FAILURE" = dev-private ] && [ "${'$'}2" = "${'$'}MOCK_DEV_TARGET" ]; }; }; }; then
                         printf "mount: unknown option '%s'\n" "${'$'}1" >&2; return 32
                     fi
                     return 0
@@ -882,7 +982,8 @@ class RuntimeChrootMountTest {
                 [ "${'$'}#" = 4 ] || { echo 'mount requires source and target' >&2; return 64; }
                 source="${'$'}3"; target="${'$'}4"
                 if [ "${'$'}1:${'$'}2" = -o:rprivate ]; then
-                    if [ "${'$'}MOCK_FAILURE" = recursive-private ]; then
+                    if { [ "${'$'}MOCK_FAILURE" = recursive-private ] && [ "${'$'}target" = "${'$'}MOCK_STORAGE_TARGET" ]; } ||
+                       { [ "${'$'}MOCK_FAILURE" = dev-private ] && [ "${'$'}target" = "${'$'}MOCK_DEV_TARGET" ]; }; then
                         echo 'mount: recursive propagation isolation denied' >&2; return 32
                     fi
                     return 0

@@ -120,6 +120,87 @@ class LocalContainerRuntimeTest {
 
     @Test fun oldConfigurationWithoutASizeCacheLoadsAndRefreshesOffline() = startup(null)
 
+    @Test fun startupResidualCleanupFailurePublishesErrorAndRetainsRetryableIdentities() = fixture { _, data, config -> runBlocking {
+        saved(data, config, 111L)
+        val runtime = LocalContainerRuntime(RuntimePaths(data, hostProot = "/missing-engine-must-not-be-launched"))
+        val exited = ProcessBuilder("/bin/sh", "-c", "exit 0").start()
+        exited.waitFor()
+        var refuseSnapshot = false
+        var refusedReads = 0
+        val tracked = TrackedProcess(exited, keeper = false, rootIdentity = 1L to "1",
+            privilegedSnapshot = {
+                if (refuseSnapshot) { refusedReads++; error("residual identity access refused") }
+                emptyList()
+            })
+        val field = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val records = field.get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
+        records[config.id] = mutableListOf(tracked)
+        refuseSnapshot = true
+        try {
+            val failure = assertFailsWith<IllegalStateException> { runtime.start(config.id) }
+            assertTrue(failure.message.orEmpty().contains("residual identity access refused"))
+            assertEquals(1, refusedReads, "Startup must not immediately repeat the same failed residual cleanup")
+            val state = runtime.containers.value.single()
+            assertTrue(state.error.orEmpty().contains("residual identity access refused"))
+            assertFalse(state.running)
+            assertEquals(0L, state.runGeneration)
+            assertEquals(0L, state.stopGeneration, "Failed startup cleanup is not a new user stop epoch")
+            assertSame(tracked, records.getValue(config.id).single())
+            refuseSnapshot = false
+            runtime.stop(config.id)
+            assertFalse(records.containsKey(config.id))
+            assertEquals(1L, runtime.containers.value.single().stopGeneration)
+            assertEquals(null, runtime.containers.value.single().error)
+        } finally { refuseSnapshot = false; runtime.close(); awaitSizeWork(runtime) }
+    } }
+
+    @Test fun idleStopConsumesCleanupFailureAndRejectsStaleEpochsAndKeepers() = fixture { _, data, config -> runBlocking {
+        saved(data, config.copy(autoSleep = true), 111L)
+        val runtime = LocalContainerRuntime(RuntimePaths(data, hostProot = "/missing-engine-must-not-be-launched"))
+        val exited = ProcessBuilder("/bin/sh", "-c", "exit 0").start()
+        exited.waitFor()
+        var refuseSnapshot = false
+        var deniedReads = 0
+        val keeper = TrackedProcess(exited, keeper = true, rootIdentity = 1L to "1", privilegedSnapshot = {
+            if (refuseSnapshot) { deniedReads++; error("idle snapshot refused") }
+            emptyList()
+        })
+        val oldKeeper = TrackedProcess(exited, keeper = true, rootIdentity = 2L to "2", privilegedSnapshot = { emptyList() })
+        @Suppress("UNCHECKED_CAST")
+        fun <T> records(name: String): MutableMap<String, T> =
+            LocalContainerRuntime::class.java.getDeclaredField(name).apply { isAccessible = true }.get(runtime) as MutableMap<String, T>
+        val processes = records<MutableList<TrackedProcess>>("processes")
+        val keepers = records<TrackedProcess>("keepers")
+        val stops = records<Long>("stopGenerations")
+        val runs = records<Long>("runGenerations")
+        processes[config.id] = mutableListOf(keeper)
+        keepers[config.id] = keeper
+        stops[config.id] = 2L
+        runs[config.id] = 7L
+        val idleStop = LocalContainerRuntime::class.java.getDeclaredMethod("stopIdleLocked", String::class.java,
+            java.lang.Long::class.java, TrackedProcess::class.java).apply { isAccessible = true }
+        refuseSnapshot = true
+        try {
+            idleStop.invoke(runtime, config.id, 1L, keeper)
+            idleStop.invoke(runtime, config.id, 2L, oldKeeper)
+            assertEquals(0, deniedReads)
+            assertFalse(keeper.stopping, "Stale timers must not stop the current keeper")
+            assertEquals(2L, stops[config.id])
+            idleStop.invoke(runtime, config.id, 2L, keeper) // Must return normally, not escape scope.launch.
+            assertEquals(1, deniedReads)
+            assertTrue(runtime.containers.value.single().error.orEmpty().contains("idle snapshot refused"))
+            assertEquals(3L, runtime.containers.value.single().stopGeneration)
+            assertEquals(7L, runtime.containers.value.single().runGeneration)
+            assertSame(keeper, keepers[config.id])
+            assertSame(keeper, processes.getValue(config.id).single())
+            refuseSnapshot = false
+            runtime.stop(config.id)
+            assertEquals(null, runtime.containers.value.single().error)
+            assertFalse(processes.containsKey(config.id))
+        } finally { refuseSnapshot = false; runtime.close(); awaitSizeWork(runtime) }
+    } }
+
     private fun restrictedStartup(engine: ContainerEngineType, pending: Boolean = false) = fixture { directory, data, config -> runBlocking {
         val root = File(config.rootfsPath)
         val home = File(root, "srv/private-home")

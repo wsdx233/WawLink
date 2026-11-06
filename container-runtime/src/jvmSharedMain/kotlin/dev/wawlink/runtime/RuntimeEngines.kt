@@ -131,7 +131,8 @@ internal class RuntimeEngines(
     private val runRootCommand: ((String) -> String)? = null,
 ) {
     private data class OwnedMount(val target: File, val recursive: Boolean = false)
-    private val ownedMounts = mutableMapOf<String, MutableList<OwnedMount>>()
+    private data class MountOwnership(val namespace: String, val mounts: MutableList<OwnedMount> = mutableListOf())
+    private val ownedMounts = mutableMapOf<String, MountOwnership>()
     private val prootCapabilities = mutableMapOf<String, String>()
     private val prootLibraryPath: String by lazy {
         val native = paths.nativeLibraryDir ?: error("缺少 Android 原生库目录")
@@ -159,7 +160,7 @@ internal class RuntimeEngines(
     /** Same HOME as builder(), without probing engines or launching a guest process. */
     fun home(config: ContainerConfig): String = containerHome(config, filesystemRootRunner(config))
 
-    fun validate(config: ContainerConfig) {
+    fun validate(config: ContainerConfig): File {
         val rootRunner = filesystemRootRunner(config)
         rootRunner?.let { RootfsOwnership.preflight(it) }
         val root = validateRoot(config)
@@ -219,6 +220,7 @@ internal class RuntimeEngines(
                 rootCommand("command -v mountpoint >/dev/null && command -v mount >/dev/null && command -v umount >/dev/null && command -v chroot >/dev/null || { echo 'Root 环境缺少 mountpoint/mount/umount/chroot 命令' >&2; exit 127; }")
             }
         }
+        return root
     }
 
     private fun hostArch(): String = guestArch(System.getProperty("os.arch", ""))
@@ -265,76 +267,82 @@ internal class RuntimeEngines(
 
     fun prepare(config: ContainerConfig, onProgress: (String, Float?) -> Unit = { _, _ -> }) {
         onProgress("检查容器引擎与运行身份", null)
-        validate(config)
+        var root = validate(config)
         RootfsOwnership.requireStable(config)
         val ownership = RootfsOwnership.load(File(config.rootfsPath))
         val expected = RootfsOwnership.mapped(config.engine)
         if (!config.ownershipMigrationDeferred && ((config.engine == ContainerEngineType.CHROOT && ownership == null) ||
             (ownership != null && ownership.physical != expected))) {
             RootfsOwnership.migrate(config, config, ::rootCommand, onProgress)
+            root = validateRoot(config)
         }
-        val root = validateRoot(config)
         onProgress("准备容器管理目录", null)
         if (config.engine != ContainerEngineType.CHROOT) {
             prepareMappedOwnership(config, root, home(config))
             return
         }
-        val owned = ownedMounts.getOrPut(config.id) { mutableListOf() }
+        val mountOwnership = ownedMounts.getOrPut(config.id) {
+            val namespace = rootCommand("readlink /proc/self/ns/mnt").trim()
+            require(Regex("mnt:\\[[0-9]+\\]").matches(namespace)) { "无法识别 su 挂载命名空间" }
+            MountOwnership(namespace)
+        }
+        val owned = mountOwnership.mounts
+        fun mountCommand(command: String): String = rootCommand(namespaceCheck(mountOwnership.namespace) + command)
         fun mount(target: File, command: String, readOnlySource: File? = null, recursive: Boolean = false) {
             onProgress("挂载 ${root.toPath().relativize(target.toPath())}", null)
             val quoted = shellQuote(target.path)
             val existing = owned.firstOrNull { it.target == target }
             if (existing != null) {
-                if (rootCommand("if mountpoint -q $quoted; then echo mounted; fi").trim() == "mounted") return
+                if (mountCommand("if mountpoint -q $quoted; then echo mounted; fi").trim() == "mounted") return
                 owned.remove(existing)
             }
-            rootCommand("if mountpoint -q $quoted; then echo '挂载点已被其他程序占用' >&2; exit 1; fi")
+            mountCommand("if mountpoint -q $quoted; then echo '挂载点已被其他程序占用' >&2; exit 1; fi")
             // Record before mount: a failed recursive bind may already have attached part of its tree.
             owned += OwnedMount(target, recursive)
-            rootCommand(command)
+            mountCommand(command)
             if (recursive) {
-                makeRecursivePrivate(target)
+                mountCommand(recursivePrivateCommand(target))
             } else {
                 // Old Android tools may lack propagation flags; never suppress the actual bind/remount.
-                rootCommand("mount --make-private $quoted" + if (paths.isAndroid) " || true" else "")
+                mountCommand("mount --make-private $quoted" + if (paths.isAndroid) " || true" else "")
             }
             if (readOnlySource != null) {
-                rootCommand("mount -o remount,bind,ro ${shellQuote(readOnlySource.path)} $quoted")
+                mountCommand("mount -o remount,bind,ro ${shellQuote(readOnlySource.path)} $quoted")
                 val mountpoint = target.canonicalPath.replace("\\", "\\134").replace(" ", "\\040")
                     .replace("\t", "\\011").replace("\n", "\\012")
-                val info = rootCommand("cat /proc/self/mountinfo")
+                val info = mountCommand("cat /proc/self/mountinfo")
                 require(info.lineSequence().any { line -> val fields = line.split(' '); fields.size > 5 && fields[4] == mountpoint && "ro" in fields[5].split(',') }) { "内核未确认只读绑定挂载：$target" }
             }
         }
         try {
             onProgress(if (config.hostRootAccess) "准备宿主机 Root 工具" else "检查宿主机 Root 工具", null)
             synchronizeHostExec(config, root, config.hostRootAccess, ::rootCommand)
-            val proc = guestTarget(root, "/proc", true, this::rootCommand)
+            val proc = guestTarget(root, "/proc", true, ::mountCommand)
             mount(proc, "mount -t proc proc ${shellQuote(proc.path)}")
-            val sys = guestTarget(root, "/sys", true, this::rootCommand)
+            val sys = guestTarget(root, "/sys", true, ::mountCommand)
             mount(sys, "mount -t sysfs sysfs ${shellQuote(sys.path)}")
-            val dev = guestTarget(root, "/dev", true, this::rootCommand)
-            mount(dev, "mount -o bind /dev ${shellQuote(dev.path)}")
-            val pts = File(dev, "pts")
-            rootCommand("[ -d /dev/pts ]")
-            val ptsTarget = guestTarget(root, "/dev/pts", true, this::rootCommand)
+            val dev = guestTarget(root, "/dev", true, ::mountCommand)
+            // /dev must be private before attaching devpts: Android may share the source tree.
+            mount(dev, "mount -o bind /dev ${shellQuote(dev.path)}", recursive = true)
+            mountCommand("[ -d /dev/pts ]")
+            val ptsTarget = guestTarget(root, "/dev/pts", true, ::mountCommand)
             mount(ptsTarget, "mount -t devpts devpts ${shellQuote(ptsTarget.path)}")
             if (config.hostRootAccess) {
                 val source = sharedStorage(root)
-                val target = guestTarget(root, "/sdcard", true, this::rootCommand)
+                val target = guestTarget(root, "/sdcard", true, ::mountCommand)
                 mount(target, "mount -o rbind ${shellQuote(source.path)} ${shellQuote(target.path)}", recursive = true)
             }
             config.mounts.forEach { binding ->
                 val source = File(binding.source).canonicalFile
-                val target = guestTarget(root, binding.target, source.isDirectory, this::rootCommand)
+                val target = guestTarget(root, binding.target, source.isDirectory, ::mountCommand)
                 mount(target, "mount -o bind ${shellQuote(source.path)} ${shellQuote(target.path)}", source.takeUnless { binding.readWrite })
             }
-            rootCommand(owned.joinToString(" && ") { "mountpoint -q ${shellQuote(it.target.path)}" } + " || { echo 'su 挂载命名空间不共享，无法安全运行 chroot' >&2; exit 1; }")
+            mountCommand(owned.joinToString(" && ") { "mountpoint -q ${shellQuote(it.target.path)}" } + " || { echo 'su 挂载命名空间不共享，无法安全运行 chroot' >&2; exit 1; }")
             onProgress("准备容器登录权限", null)
             val user = loginIdentity(config, this::rootCommand)
             if (config.ownershipMigrationDeferred && ownership?.physical == ContainerEngineType.PROOT) {
                 prepareMappedOwnership(config, root, loginHome(config, user))
-            } else prepareChrootOwnership(config, root, user.uid, user.gid, loginHome(config, user), ::rootCommand)
+            } else prepareChrootOwnership(config, root, user.uid, user.gid, loginHome(config, user), ::mountCommand)
         } catch (failure: Throwable) {
             try { unmount(config.id) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
             throw failure
@@ -342,21 +350,48 @@ internal class RuntimeEngines(
     }
 
     fun unmount(id: String) {
-        val owned = ownedMounts[id] ?: return
-        val failures = mutableListOf<Throwable>()
-        owned.toList().asReversed().forEach { mount ->
-            try {
-                if (mount.recursive) unmountRecursive(mount.target)
-                else rootCommand("if mountpoint -q ${shellQuote(mount.target.path)}; then umount ${shellQuote(mount.target.path)}; fi")
-                owned.remove(mount)
-            } catch (failure: Throwable) { failures += failure }
+        val ownership = ownedMounts[id] ?: return
+        val owned = ownership.mounts
+        if (owned.isEmpty()) { ownedMounts.remove(id); return }
+        // One plan per disjoint owned tree, including mounts added after prepare (not just pts).
+        val roots = owned.asReversed().filter { candidate ->
+            owned.none { other -> other != candidate && candidate.target.toPath().startsWith(other.target.toPath()) }
         }
-        if (owned.isEmpty()) ownedMounts.remove(id)
-        if (failures.isNotEmpty()) throw IllegalStateException("安全卸载未完成：${failures.joinToString("；") { it.message.orEmpty() }}", failures.first())
-            .also { failure -> failures.drop(1).forEach(failure::addSuppressed) }
+        try {
+            val mounted = currentMounts(ownership.namespace)
+            val script = buildString {
+                append("status=0\n")
+                roots.forEach { mount ->
+                    val target = mount.target.toPath()
+                    val tree = mounted.filter { it.toPath().startsWith(target) }
+                        .asReversed().sortedByDescending { it.toPath().nameCount }
+                    if (tree.isEmpty()) return@forEach
+                    append("(\n")
+                    if (mount.recursive || tree.size > 1) {
+                        // A partial bind can leave children without the requested parent mount.
+                        tree.distinct().filter { entry -> tree.none { other ->
+                            other != entry && entry.toPath().startsWith(other.toPath())
+                        } }.forEach { entry -> append(recursivePrivateCommand(entry)).append(" || exit ${'$'}?\n") }
+                    }
+                    // Explicit exits also work inside an OR-list, where shell errexit is disabled.
+                    tree.forEach { entry -> append("umount ").append(shellQuote(entry.path)).append(" || exit ${'$'}?\n") }
+                    append(") || status=${'$'}?\n")
+                }
+                append("exit \"${'$'}status\"\n")
+            }
+            if (mounted.any { entry -> roots.any { entry.toPath().startsWith(it.target.toPath()) } }) {
+                rootCommand(namespaceCheck(ownership.namespace) + script)
+                val remaining = currentMounts(ownership.namespace).filter { entry -> roots.any { entry.toPath().startsWith(it.target.toPath()) } }
+                check(remaining.isEmpty()) { "挂载仍未卸载：${remaining.joinToString { it.path }}" }
+            }
+            ownedMounts.remove(id)
+        } catch (failure: Throwable) {
+            // Keep all records after partial failure; the next snapshot skips mounts already gone.
+            throw IllegalStateException("安全卸载未完成：${failure.message.orEmpty()}", failure)
+        }
     }
 
-    fun hasOwnedMounts(id: String): Boolean = !ownedMounts[id].isNullOrEmpty()
+    fun hasOwnedMounts(id: String): Boolean = !ownedMounts[id]?.mounts.isNullOrEmpty()
 
     private fun sharedStorage(root: File): File {
         val candidate = paths.primaryExternalStorage?.path ?: "/sdcard"
@@ -375,36 +410,33 @@ internal class RuntimeEngines(
         return source
     }
 
-    private fun recursiveMounts(target: File): List<File> {
+    private fun currentMounts(namespace: String): List<File> {
         val escaped = Regex("""\\([0-7]{3})""")
-        return rootCommand("cat /proc/self/mountinfo").lineSequence().filter(String::isNotBlank).map { line ->
+        return rootCommand(namespaceCheck(namespace) + "cat /proc/self/mountinfo").lineSequence().filter(String::isNotBlank).map { line ->
             val fields = line.split(' ')
-            require(fields.size >= 7) { "无法解析递归挂载信息" }
+            require(fields.size >= 7) { "无法解析实际挂载信息" }
             File(escaped.replace(fields[4]) { it.groupValues[1].toInt(8).toChar().toString() })
-        }.filter { it.toPath().startsWith(target.toPath()) }.sortedByDescending { it.toPath().nameCount }.toList()
+        }.toList()
     }
 
-    private fun makeRecursivePrivate(target: File) {
+    private fun recursivePrivateCommand(target: File): String {
         val quoted = shellQuote(target.path)
         val fallback = if (paths.isAndroid) " || mount -o rprivate none $quoted" else ""
-        rootCommand("mount --make-rprivate $quoted$fallback")
+        return "mount --make-rprivate $quoted$fallback"
     }
 
-    private fun unmountRecursive(target: File) {
-        // A busy child aborts this tree; keep its ownership record and never detach its parent lazily.
-        val mounted = recursiveMounts(target)
-        if (mounted.isEmpty()) return
-        // Also covers a prepare failure before propagation was isolated; never unmount shared peers.
-        makeRecursivePrivate(target)
-        mounted.forEach { entry -> rootCommand("umount ${shellQuote(entry.path)}") }
-        check(recursiveMounts(target).isEmpty()) { "递归挂载仍未卸载：${target.path}" }
-    }
+    private fun namespaceCheck(namespace: String): String =
+        "[ \"${'$'}(readlink /proc/self/ns/mnt)\" = ${shellQuote(namespace)} ] || { echo 'su 挂载命名空间已改变，保留挂载并拒绝操作' >&2; exit 125; }\n"
 
     fun builder(config: ContainerConfig, arguments: List<String>, cwd: String, environment: Map<String, String>, mergeError: Boolean, rootPidFile: File? = null): ProcessBuilder {
         require(arguments.isNotEmpty() && arguments.none { '\u0000' in it }) { "容器启动参数无效" }
         require(cwd.startsWith('/') && '\u0000' !in cwd && !cwd.split('/').contains("..")) { "工作目录必须是容器内绝对路径" }
         val rootRunner = filesystemRootRunner(config)
-        rootRunner?.let { RootfsOwnership.preflight(it) }
+        if (config.engine == ContainerEngineType.CHROOT) {
+            require(hasOwnedMounts(config.id)) { "chroot 尚未完成系统挂载" }
+            // prepare already checked migration tools; this launch still validates Rootfs,
+            // current login identity, its actual mount namespace, and the Root PID handshake.
+        } else rootRunner?.let { RootfsOwnership.preflight(it) }
         val root = validateRoot(config)
         val user = loginIdentity(config, rootRunner)
         val env = linkedMapOf("HOME" to loginHome(config, user), "USER" to user.name, "LOGNAME" to user.name, "TERM" to "xterm-256color", "LANG" to "C.UTF-8", "PATH" to "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
@@ -451,9 +483,10 @@ internal class RuntimeEngines(
                     done
                     rm -f $acknowledgement
                 """.trimIndent() + "\n"
-                val mountCheck = ownedMounts[config.id].orEmpty().joinToString(" && ") { "mountpoint -q ${shellQuote(it.target.path)}" }
+                val ownership = requireNotNull(ownedMounts[config.id]) { "chroot 尚未完成系统挂载" }
+                val mountCheck = ownership.mounts.joinToString(" && ") { "mountpoint -q ${shellQuote(it.target.path)}" }
                 require(mountCheck.isNotEmpty()) { "chroot 尚未完成系统挂载" }
-                listOf("su", "-c", mountCheck + " || { echo 'su 挂载命名空间不共享，拒绝启动 chroot' >&2; exit 125; };\n" + handshake + "exec chroot ${shellQuote(root.path)} " + inner.joinToString(" ", transform = ::shellQuote))
+                listOf("su", "-c", namespaceCheck(ownership.namespace) + mountCheck + " || { echo 'su 挂载命名空间不共享，拒绝启动 chroot' >&2; exit 125; };\n" + handshake + "exec chroot ${shellQuote(root.path)} " + inner.joinToString(" ", transform = ::shellQuote))
             }
         }
         return ProcessBuilder(command).directory(paths.dataDir).redirectErrorStream(mergeError).also { hostEnvironment(it, config.engine) }
@@ -537,7 +570,7 @@ internal class RuntimeEngines(
             command.startsWith(ROOTFS_SIZE_SCAN_MARKER, first) -> RootCommandStage.SIZE_SCAN
             command.startsWith(ROOTFS_OWNERSHIP_MIGRATION_MARKER, first) -> RootCommandStage.OWNERSHIP_MIGRATION
             command.startsWith(ROOT_PERMISSION_CHECK_MARKER, first) -> RootCommandStage.PERMISSION_CHECK
-            command.contains("/proc/self/mountinfo") || command.contains("mountpoint") || command.contains("mount ") || command.contains("umount ") -> RootCommandStage.MOUNT
+            command.contains("/proc/self/mountinfo") || command.contains("/proc/self/ns/mnt") || command.contains("mountpoint") || command.contains("mount ") || command.contains("umount ") -> RootCommandStage.MOUNT
             else -> RootCommandStage.OTHER
         }
     }

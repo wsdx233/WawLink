@@ -133,6 +133,8 @@ Host commands use Android's `PATH`, `ANDROID_ROOT=/system`, and `ANDROID_DATA=/d
 
 Stop, failed startup, and unregister tear down recursive child mounts before their parents. Propagation-isolation or unmount failures retain cleanup records for retry instead of claiming success with lazy unmounts. Disabling the option or leaving chroot only removes the exact app-managed `host-exec`; user-owned files with that name are not overwritten or deleted. This is a convenience interface, not a security-isolation or privilege-revocation boundary for chroot Root.
 
+Before attaching `/dev/pts`, chroot must isolate propagation on its `/dev` bind. Preparation, guest launch, and unmount use the same pinned `su` mount namespace. Stop discovers late child mounts from the actual mount table and unmounts leaves first in a batch; a busy child blocks its parents and retains cleanup records for retry. Only a runtime with process or mount remnants scans `/proc/PID/root` to reclaim reparented guests, rechecks PID/starttime before signaling, and waits boundedly after TERM/KILL. It never kills host processes merely for sharing `/dev` descriptors or adopts unknown processes/mounts left by another runtime. Auto-sleep cleanup failures become container errors rather than uncaught background exceptions. Already-running containers skip repeated startup DNS reads, and guest launches no longer repeat ownership-migration tool checks; actual Rootfs, identity, read-only mount, namespace, and PID-handshake validation remains.
+
 ## Build from Source
 
 WawLink uses a standard Gradle build system with Docker-free preparation scripts.

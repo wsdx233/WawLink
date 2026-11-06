@@ -326,12 +326,16 @@ class LocalContainerRuntime internal constructor(
         ensureAvailable(id)
         val config = config(id)
         RootfsOwnership.requireStable(config)
-        paths.resolvConf?.value?.let { updateDns(config, it) }
         if (keepers[id]?.let { !it.stopping && it.process.isAlive } == true) return
-        if (keepers.containsKey(id) || engines.hasOwnedMounts(id)) stopLocked(id, intentional = false)
+        paths.resolvConf?.value?.let { updateDns(config, it) }
         val report = progressReporter(id, config.displayName)
+        var prepared = false
         try {
+            if (keepers.containsKey(id) || processes[id].orEmpty().isNotEmpty() || engines.hasOwnedMounts(id)) {
+                stopLocked(id, intentional = false)
+            }
             engines.prepare(config, report)
+            prepared = true
             if (config.engine == ContainerEngineType.PROOT || config.engine == ContainerEngineType.PROROOT) {
                 RuntimeIdentity.update(engines.validateRoot(config), RuntimeIdentity.hostSupplementaryGroupIds(File("/proc/self/status").readText(Charsets.UTF_8)), config = config)
             }
@@ -342,7 +346,6 @@ class LocalContainerRuntime internal constructor(
             val health = launchLocked(config, listOf("/bin/sh", "-c", "id >/dev/null"), "/", emptyMap(), true, false).process
             val checkOutput = scope.async { health.inputStream.bufferedReader().use { it.readText() } }
             if (!health.waitFor(90, TimeUnit.SECONDS)) {
-                stopLocked(id, intentional = false)
                 error("容器引擎启动超时，请检查 Rootfs/QEMU")
             }
             val output = checkOutput.await()
@@ -355,7 +358,7 @@ class LocalContainerRuntime internal constructor(
             errors.remove(id)
             publish()
         } catch (failure: Throwable) {
-            try { stopLocked(id, intentional = false) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
+            if (prepared) try { stopLocked(id, intentional = false) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
             errors[id] = failure.message ?: "容器启动失败"
             publish()
             throw failure
@@ -382,15 +385,34 @@ class LocalContainerRuntime internal constructor(
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
         while (System.nanoTime() < deadline && owned.any { it.hasLiveProcesses() }) Thread.sleep(50)
         terminate(owned, root, true)
-        owned.forEach { if (it.process.isAlive) it.process.destroyForcibly(); it.process.waitFor(2, TimeUnit.SECONDS) }
+        owned.forEach { if (it.process.isAlive) it.process.destroyForcibly() }
+        waitForTrackedExit(owned, 2)
+        if (root && (owned.isNotEmpty() || keepers.containsKey(id) || engines.hasOwnedMounts(id))) {
+            val canonicalRoot = RootfsAccess.canonicalRoot(config(id), engines::rootCommand)
+            engines.rootCommand(ChrootProcessCleanup.script(canonicalRoot))
+        }
         owned.forEach { it.terminal?.close() }
         check(owned.none { it.hasLiveProcesses() }) { "容器仍有已跟踪进程未退出，已保留挂载以保护文件系统" }
+        try { engines.unmount(id); errors.remove(id) }
+        catch (failure: Throwable) { errors[id] = failure.message.orEmpty(); publish(); throw failure }
         processes.remove(id)
         keepers.remove(id)
         runGenerations.remove(id)
-        try { engines.unmount(id); errors.remove(id) }
-        catch (failure: Throwable) { errors[id] = failure.message.orEmpty(); publish(); throw failure }
         publish()
+    }
+
+    /** KILL delivery is not exit: grandchildren can outlive the held su/engine Process. */
+    private fun waitForTrackedExit(owned: List<TrackedProcess>, seconds: Long) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds)
+        while (owned.any { it.hasLiveProcesses() } && System.nanoTime() < deadline) Thread.sleep(50)
+    }
+
+    private fun stopIdleLocked(id: String, scheduledStopGeneration: Long?, keeperAtSchedule: TrackedProcess?) {
+        if (stopGenerations[id] != scheduledStopGeneration || keepers[id] !== keeperAtSchedule ||
+            processes[id].orEmpty().any { !it.keeper && !it.stopping }) return
+        try { stopLocked(id) }
+        catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: Exception) { errors[id] = "容器自动休眠失败：${failure.message}"; publish() }
     }
 
     private fun terminate(owned: List<TrackedProcess>, asRoot: Boolean, force: Boolean) {
@@ -1038,13 +1060,20 @@ class LocalContainerRuntime internal constructor(
         }
         scope.launch {
             try {
-                while (if (keeper) process.isAlive else tracked.hasLiveProcesses()) { tracked.refreshDescendants(); delay(300) }
+                while (!tracked.stopping && (if (keeper) process.isAlive else tracked.hasLiveProcesses())) { tracked.refreshDescendants(); delay(300) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
             } catch (failure: Exception) {
-                mutex.withLock { errors[config.id] = "无法安全跟踪容器进程：${failure.message}"; publish() }
+                mutex.withLock {
+                    if (!tracked.stopping && processes[config.id]?.contains(tracked) == true) {
+                        errors[config.id] = "无法安全跟踪容器进程：${failure.message}"; publish()
+                    }
+                }
                 return@launch
             }
             mutex.withLock {
-                if (tracked.stopping || closed) { processes[config.id]?.remove(tracked); return@withLock }
+                // Failed stops retain identity records for retry; never discard them on EOF.
+                if (tracked.stopping || closed) return@withLock
                 if (keeper && keepers[config.id] === tracked) {
                     val reason = "容器引擎进程已退出（${process.exitValue()}）"
                     try { stopLocked(config.id, intentional = false); errors[config.id] = reason }
@@ -1053,7 +1082,12 @@ class LocalContainerRuntime internal constructor(
                 } else {
                     processes[config.id]?.remove(tracked)
                     if (!keeper && configurations[config.id]?.autoSleep == true && processes[config.id].orEmpty().none { !it.keeper }) {
-                        idleJobs[config.id] = scope.launch { delay(30_000); mutex.withLock { if (processes[config.id].orEmpty().none { !it.keeper }) stopLocked(config.id) } }
+                        val stopGeneration = stopGenerations[config.id]
+                        val keeperAtSchedule = keepers[config.id]
+                        idleJobs[config.id] = scope.launch {
+                            delay(30_000)
+                            mutex.withLock { stopIdleLocked(config.id, stopGeneration, keeperAtSchedule) }
+                        }
                     }
                 }
             }
@@ -1130,7 +1164,7 @@ class LocalContainerRuntime internal constructor(
                                 process.waitFor(2, TimeUnit.SECONDS)
                                 terminate(listOf(tracked), root, true)
                                 if (process.isAlive) process.destroyForcibly()
-                                process.waitFor(2, TimeUnit.SECONDS)
+                                waitForTrackedExit(listOf(tracked), 2)
                                 check(!tracked.hasLiveProcesses()) { "终端仍有已跟踪子进程未退出" }
                             } catch (failure: Exception) {
                                 errors[id] = "终端关闭失败：${failure.message}"
@@ -1211,7 +1245,10 @@ class LocalContainerRuntime internal constructor(
                 finishDeployment(staged.id)
             }
             rootfsImports.clear()
-            configurations.keys.toList().forEach { id -> try { stopLocked(id) } catch (failure: Throwable) { failures += failure } }
+            configurations.keys.toList().forEach { id ->
+                try { stopLocked(id) }
+                catch (failure: Throwable) { failures += failure; errors[id] = failure.message ?: "容器关闭失败"; publish() }
+            }
             if (failures.isNotEmpty()) throw IllegalStateException("部分容器未能安全关闭；请恢复 Root 权限后重试，进程与挂载记录已保留", failures.first()).also { error -> failures.drop(1).forEach(error::addSuppressed) }
             closed = true
         } }
