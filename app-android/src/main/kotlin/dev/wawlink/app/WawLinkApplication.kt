@@ -19,6 +19,8 @@ import kotlinx.coroutines.*
 class WawLinkApplication : Application() {
     lateinit var coordinator: AppCoordinator
         private set
+    internal lateinit var sessionTaskNotifications: SessionTaskNotifications
+        private set
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var containerService: ContainerForegroundService? = null
@@ -45,6 +47,7 @@ class WawLinkApplication : Application() {
         val runtime = LocalContainerRuntime(RuntimePaths(data, nativeLibraryDir = File(applicationInfo.nativeLibraryDir), isAndroid = true,
             resolvConf = resolvConf, primaryExternalStorage = Environment.getExternalStorageDirectory()))
         coordinator = AppCoordinator(runtime, OmpProcessPool(runtime, data, resolvConf = resolvConf), data, isAndroid = true)
+        sessionTaskNotifications = SessionTaskNotifications(this, coordinator, scope)
         scope.launch {
             // AppCoordinator.active already includes Android keep-alive demand.
             coordinator.active.collect { needed ->

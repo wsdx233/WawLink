@@ -63,9 +63,29 @@ internal fun bytesLabel(bytes: Long): String = when {
             SectionLabel("进行中的操作", "deployed_code")
             deployments.forEach { task ->
                 key(task.id) {
+                    var taskBusy by remember { mutableStateOf(false) }
+                    LaunchedEffect(task.cancellable, task.retryable) { taskBusy = false }
+                    fun perform(work: suspend () -> Unit) {
+                        if (taskBusy) return
+                        taskBusy = true
+                        app.launch { try { work() } finally { taskBusy = false } }
+                    }
                     Column(Modifier.fillMaxWidth().padding(bottom = 3.dp).background(MaterialTheme.colorScheme.surfaceContainerLow, RoundedCornerShape(20.dp)).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text(task.name, fontSize = 19.sp, fontWeight = FontWeight.SemiBold)
                         ContainerOperationProgress(task)
+                        if (task.cancellable || task.retryable) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                            if (task.cancellable) TextButton({ perform { app.runtime.cancelDeployment(task.id) } }, enabled = !taskBusy) {
+                                Symbol("close", size = 20.dp); Spacer(Modifier.width(8.dp)); Text("取消", fontSize = 16.sp)
+                            }
+                            if (task.retryable) {
+                                TextButton({ perform { app.runtime.dismissDeployment(task.id) } }, enabled = !taskBusy) {
+                                    Symbol("clear_all", size = 20.dp); Spacer(Modifier.width(8.dp)); Text("清除", fontSize = 16.sp)
+                                }
+                                TextButton({ perform { app.retryDistroDeployment(task.id) } }, enabled = !taskBusy) {
+                                    Symbol("refresh", size = 20.dp); Spacer(Modifier.width(8.dp)); Text("重试", fontSize = 16.sp)
+                                }
+                            }
+                        }
                     }
                 }
             }

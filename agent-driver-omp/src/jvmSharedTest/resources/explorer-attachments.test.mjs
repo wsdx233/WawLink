@@ -47,7 +47,7 @@ async function modules(registry = { list: () => [], get: () => undefined }) {
     let module;
     if (specifier.startsWith('node:')) module = namespaceModule(await import(specifier));
     else if (native[specifier]) module = namespaceModule(native[specifier]);
-    else if (['./explorer-history.mjs', './explorer-runtime.mjs'].includes(specifier)) {
+    else if (['./explorer-history.mjs', './explorer-runtime.mjs', './history-search.mjs', './attachment-prompts.mjs'].includes(specifier)) {
       const source = await readFile(new URL(`../../jvmSharedMain/resources/omp-management/${specifier.slice(2)}`, import.meta.url), 'utf8');
       module = new SourceTextModule(source, { context, identifier: specifier });
     } else throw Error(`Unexpected native import: ${specifier}`);
@@ -117,6 +117,59 @@ test('strict history parser preserves malformed, fenced and nontrailing examples
   assert.equal(history.parseAttachmentPrompt(wire(originalExample, 'real.png', '/real.png')).text, originalExample);
   assert.equal(history.parseAttachmentPrompt(wire('```text')).text, '```text');
   assert.equal(history.parseAttachmentPrompt(wire('', ' literal\\name.txt ', '/workspace/literal\\name.txt')).attachments[0].name, ' literal\\name.txt ');
+});
+
+test('explicit full text search finds tails, literal code, thinking and attachment names without transport paths', async () => {
+  const { history } = await modules();
+  const entries = [
+    entry('user', wire(`${'开头'.repeat(300)}\n完整正文 TailNeedle a+b[0]`, '附件名称.txt', '/transport/only-hidden-path.txt')),
+    { id: 'assistant', parentId: 'user', type: 'message', message: { role: 'assistant', content: [
+      { type: 'thinking', thinking: `${'思考'.repeat(300)} 深处思考` },
+      { type: 'text', text: '模型正文' },
+      { type: 'toolCall', id: 'call', name: 'bash', arguments: { command: 'printf literal-code' } },
+      { type: 'image', data: 'hidden-image-bytes' },
+    ] } },
+  ];
+  const manager = { getSessionId: () => 'native', getSessionFile: () => '/session/main.jsonl', getEntries: () => entries, getLeafId: () => 'assistant' };
+  const index = history.historySnapshot(manager);
+  assert.ok(!index.nodes[0].searchText.includes('TailNeedle'));
+  const search = query => history.historySearch(manager, { sessionId: 'native', revision: index.revision, query });
+  for (const query of ['tailneedle', 'a+b[0]', '附件名称', '深处思考', 'literal-code']) {
+    const result = search(query);
+    assert.equal(result.total, 1, query);
+    const match = result.matches[0];
+    assert.equal(match.text.slice(match.matchStart, match.matchEnd).toLowerCase(), query.toLowerCase());
+    assert.equal(match.version, index.nodes.find(node => node.id === match.entryId).version);
+    assert.ok(!('entry' in match) && !('rawRecord' in match));
+    assert.ok(match.text.length < 400);
+  }
+  assert.equal(search('/transport/only-hidden-path.txt').total, 0);
+  assert.equal(search('hidden-image-bytes').total, 0);
+  assert.equal(manager.getLeafId(), 'assistant');
+  assert.throws(() => history.historySearch(manager, { sessionId: 'other', query: '正文' }), /会话已变化/);
+  assert.throws(() => history.historySearch(manager, { sessionId: 'native', revision: 'old', query: '正文' }), /历史已更新/);
+});
+
+test('full text result pages keep one native snapshot and reject reused cursors across query or session', async () => {
+  const { history } = await modules();
+  let file = '/session/main.jsonl';
+  const entries = Array.from({ length: 130 }, (_, index) => entry(`message-${index}`, `${'prefix'.repeat(50)} SearchNeedle ${index}`));
+  const manager = { getSessionId: () => 'native', getSessionFile: () => file, getEntries: () => entries, getLeafId: () => entries.at(-1).id };
+  const index = history.historySnapshot(manager);
+  const first = history.historySearch(manager, { sessionId: 'native', revision: index.revision, query: 'SearchNeedle' });
+  assert.equal(first.total, 130); assert.equal(first.matches.length, 64);
+  entries[70] = entry('message-70', 'changed after first page');
+  history.historySnapshot(manager, { since: index.revision });
+  const second = history.historySearch(manager, { sessionId: 'native', query: 'SearchNeedle', cursor: first.nextCursor });
+  const third = history.historySearch(manager, { sessionId: 'native', query: 'SearchNeedle', cursor: second.nextCursor });
+  assert.equal(second.revision, first.revision); assert.equal(second.matches.length, 64);
+  assert.equal(third.matches.length, 2); assert.equal(third.nextCursor, null);
+  const all = [...first.matches, ...second.matches, ...third.matches];
+  assert.equal(new Set(all.map(hit => hit.entryId)).size, 130);
+  assert.ok(all.find(hit => hit.entryId === 'message-70').text.includes('SearchNeedle'));
+  assert.throws(() => history.historySearch(manager, { sessionId: 'native', query: 'different', cursor: first.nextCursor }), /已过期/);
+  file = '/session/replaced.jsonl';
+  assert.throws(() => history.historySearch(manager, { sessionId: 'native', query: 'SearchNeedle', cursor: first.nextCursor }), /已过期/);
 });
 
 test('child prompt, native snapshots, blank queue edit and take keep transport identity isolated', async () => {

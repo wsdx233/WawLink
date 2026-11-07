@@ -67,6 +67,8 @@ internal fun ContainerFilesScreen(app: AppCoordinator, host: HostFiles, config: 
     var delete by remember { mutableStateOf<List<String>?>(null) }
     var properties by remember { mutableStateOf<List<ContainerFileSelection>?>(null) }
     var code by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var editing by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var editorDismiss by remember { mutableStateOf<(() -> Unit)?>(null) }
     var bookmarksOpen by remember { mutableStateOf(false) }
     var bookmarkMenu by remember { mutableStateOf<String?>(null) }
     var bookmarks by remember { mutableStateOf(emptyMap<String, String>()) }
@@ -107,6 +109,7 @@ internal fun ContainerFilesScreen(app: AppCoordinator, host: HostFiles, config: 
         }
     }
     fun browserBack(): Boolean = when {
+        editing != null -> { editorDismiss?.invoke(); true }
         code != null -> { code = null; true }
         operation != null -> true
         selecting -> { clearSelection(); true }
@@ -161,6 +164,11 @@ internal fun ContainerFilesScreen(app: AppCoordinator, host: HostFiles, config: 
         action = null
         val source = ContainerFileService.child(path, file.name)
         run("正在读取文本", false) { code = file.name to service.readText(source) }
+    }
+    fun editText(file: ContainerFile) {
+        action = null
+        val source = ContainerFileService.child(path, file.name)
+        run("正在读取文本", false) { editing = source to service.readText(source) }
     }
     fun showProperties(files: List<ContainerFileSelection>) { properties = files; action = null }
     Box(Modifier.fillMaxSize()) {
@@ -286,6 +294,17 @@ internal fun ContainerFilesScreen(app: AppCoordinator, host: HostFiles, config: 
             }, Modifier.fillMaxWidth().padding(12.dp), enabled = !busy && pickedPaths.isNotEmpty())
         }
         code?.let { (title, text) -> Surface(Modifier.fillMaxSize()) { CodeDetailScreen(title, text, title.substringAfterLast('.', "").ifEmpty { null }, { code = null }) } }
+        editing?.let { (source, original) -> key(source) {
+            EditableCodeScreen(source.substringAfterLast('/'), original, source.substringAfterLast('.', "").ifEmpty { null },
+                onDismiss = { if (!busy) { editing = null; failure = null } },
+                registerDismiss = { editorDismiss = it }, error = failure, saving = busy,
+                onSave = { draft ->
+                    run("正在保存文本", false) {
+                        service.writeText(source, draft, expectedText = original)
+                        editing = null; failure = null; refresh++
+                    }
+                })
+        } }
     }
     if (pathSheet) AgentActionSheet({ pathSheet = false }) {
         AgentActionRow("当前目录", path, "folder_open")
@@ -321,7 +340,7 @@ internal fun ContainerFilesScreen(app: AppCoordinator, host: HostFiles, config: 
             if (file.supported) {
                 AgentActionRow("复制", icon = "content_copy", onClick = { copy(listOf(source)) })
                 if (file.directory) AgentActionRow("进入目录", icon = "folder_open", onClick = { action = null; navigate(source) })
-                else ContainerFileOpenRows(file, { openExternal(file) }, { openText(file) })
+                else ContainerFileOpenRows(file, { openExternal(file) }, { openText(file) }, { editText(file) })
                 AgentActionRow("下载", if (file.directory) "保留目录结构，保存为 ZIP" else "保存原文件", "download", { action = null; downloadOptions = listOf(source) })
                 AgentActionRow("重命名", icon = "drive_file_rename_outline", onClick = { action = null; renameSource = source; name = file.name; nameAction = "rename" })
                 AgentActionRow(if (file.directory) "删除目录" else "删除文件", icon = "delete", dangerous = true, onClick = { action = null; delete = listOf(source) })
@@ -445,10 +464,11 @@ internal fun ContainerFileLinkSheet(app: AppCoordinator, host: HostFiles, config
 }
 
 @Composable
-private fun ContainerFileOpenRows(file: ContainerFile, onOpen: () -> Unit, onText: () -> Unit) {
+private fun ContainerFileOpenRows(file: ContainerFile, onOpen: () -> Unit, onText: () -> Unit, onEdit: () -> Unit) {
     val apk = containerFileMimeType(file.name) == "application/vnd.android.package-archive"
     AgentActionRow(if (apk) "安装 APK" else "打开", if (apk) "Android 系统安装器将要求确认；桌面不支持安装" else containerFileMimeType(file.name), if (apk) "android" else "open_in_new", onOpen)
     if (!apk) AgentActionRow("查看文本", "UTF-8，最大 2 MiB；二进制文件请使用打开", "code", onText)
+    if (!apk && file.readable) AgentActionRow("编辑", icon = "edit", onClick = onEdit)
 }
 
 @Composable

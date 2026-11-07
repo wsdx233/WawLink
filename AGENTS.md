@@ -55,6 +55,11 @@
 - 模型选择列表及服务筛选仅展示 OMP 原生判定可用的模型，不把缺少认证或已停用的模型作为可选项，也不提供关闭可用性过滤的开关。管理目录仍可查看和配置不可用模型，已有绑定及高级选择器不因候选隐藏而被删除或改写。
 - 新会话在发送前同步 OMP 原生解析的默认模型身份及可确定的思考档位；读取期间使用标准进度组件，不显示空 ID 的问号图标。异步默认值不得覆盖手动选择、历史或已启动 RPC 的状态；显示预览不写配置，也不作为显式模型参数固定后续原生启动。
 - 用户消息和运行中追加消息先即时本地显示，不等待 OMP 启动或 RPC 回执；按稳定 ID 与回执对齐，发送失败撤回对应的未接收消息并显示原因，已接收消息不因后续模型执行失败而撤回。
+- 主会话明确拒收的发送内容按稳定 ID 保留原文、空白、附件与追加种类，提供取回与重发；已有草稿须确认替换，已接收内容不得重复重发。请求发出后结果不确定时保留内容并明确提示核对历史，禁用直接重发。已有会话的输入草稿在应用私有目录异步原子保存，跨重启恢复，不恢复控制器或启动容器，不将未发送的空新会话写入会话列表；迟到读取、写入与删除不能覆盖新草稿。
+- Android 任务通知独立于前台服务通知，按主会话真实完成、失败、Ask 与审批状态发送，可在应用设置关闭；当前可见会话不重复提醒，点击按会话身份打开。通知不绕过文件或设置编辑中的保存流程，不以主会话冒充子代理通知，不恢复未打开的历史控制器。
+- 全文查找仅由用户显式发起，当前会话通过客体读取完整正文并按固定快照分页；跨会话限定当前选中容器的真实会话元数据，原生历史与正文保持在客体，命中片段分页返回，启动不批量恢复会话。定位须复核原生会话与节点 ID，不改变续写位置；取消、停止与离页回收查询进程，不以摘要前缀或截断结果冒充全文。
+- 独立文件管理的文本编辑复用聊天路径的原生编辑器与原子冲突检查，保留失败草稿及舍弃确认。在线发行版任务提供真实取消、原参数重试与失败清除，取消回收传输与未注册内容，已注册容器不受迟到取消删除；不以重试冒充断点续传。
+- 首次使用准备页按当前容器检查 OMP、原生可用模型与明确默认身份，提供容器、OMP、模型配置的连续入口及真实部署进度；检查不自动安装，停止或取消不自动重启。已有用户新建会话保留直接创建路径，应用设置可重新进入准备页。
 - 聊天错误固定显示在输入框上方，保留真实错误和关闭操作；依据可识别的 OMP、模型及认证错误提供真实修复或设置入口，不将普通缺失文件误判为 OMP 损坏。修复仍须用户确认，不自动安装。
 - 全应用运行时错误保留简洁摘要，并统一提供“查看详情”Dialog：支持滚动、选择与复制，保留真实原因、阶段、超时和可得异常链；显示与复制前脱敏常见凭据，不以详情替换现有关闭、重试、修复或草稿保留交互。
 - 会话输入框和排队消息编辑均支持多行，普通 Enter 与软键盘回车用于换行，不触发发送或保存；发送、保存分别使用对应按钮。Slash 菜单通过 Tab 或点击选择，不拦截回车换行。
@@ -114,6 +119,7 @@
 ## 项目结构与索引
 
 - `agent-protocol/`：独立 Kotlin 领域模型、会话控制、模型服务与设置契约；仅使用协程状态流，不依赖驱动或容器。
+  - `src/commonMain/kotlin/dev/wawlink/protocol/ComposerDraftRepository.kt` 定义宿主草稿的按需读取与即时内存更新契约；`AgentProtocol.kt` 的失败发送内容按稳定 ID 隔离取回与重发。
   - `src/commonMain/kotlin/dev/wawlink/protocol/AgentManagement.kt` 定义作用域、来源、Agent、顾问、角色、认证、原始配置与原生管理仓库契约。
   - 同目录的 `AgentResources.kt` 定义按当前容器、配置档与项目上下文执行原生插件/技能操作的 `AgentResourceRepository`，不依赖模型 SDK。
   - 同目录的 `SessionExplorer.kt` 定义完整轻量历史索引、分种类按需详情、消息复制片段、恢复草稿、运行实例、活动、产物、后台任务及按实例隔离的会话探索契约。
@@ -121,6 +127,7 @@
   - 同目录的 `AgentPalette.kt`、`AgentPaletteSettings.kt` 提供默认蓝色、Material HCT 种子配色与设置控件；`src/androidMain/kotlin/dev/wawlink/ui/AgentPalette.android.kt` 读取系统动态配色，`src/desktopMain/kotlin/dev/wawlink/ui/AgentPalette.desktop.kt` 明确回退，`AgentPaletteTest.kt` 覆盖明暗配色对比度及 HEX 输入边界。完整 Material Color Utilities 许可随 `src/commonMain/composeResources/files/licenses/material-color-utilities.txt` 打包。
   - 同目录的 `AgentTheme.kt` 提供统一主题、标准表单 sheet，以及参考 WawSSH 的 `AgentActionSheet` / `AgentActionRow` 全宽操作面板与列表行。
   - `src/commonMain/kotlin/dev/wawlink/ui/ComposerSlashCommands.kt` 提供原生命令的图标/中文展示匹配，`AskDraftState.kt` 保存按问题 ID 隔离的答案、页码与预览状态。
+  - 同目录的 `FailedPromptRecovery.kt` 提供未接收内容取回、重发、多个失败项选择及草稿替换确认；`Composer.kt` 以编辑版本保护异步草稿恢复并复用宿主持久化契约。`ComposerDraftRegistry.kt` 及 `src/jvmSharedMain/kotlin/dev/wawlink/ui/ComposerDraftRegistry.jvm.kt` 由宿主持有每个已打开会话的共享输入状态和取回锁，单一 Saveable 快照仅初始化不存在的条目；`src/commonTest/kotlin/dev/wawlink/ui/ComposerDraftRegistryTest.kt` 覆盖迟到取回、旧快照优先级、会话隔离、进程重建及删除关闭清理。
   - 同目录的 `MarkdownParts.kt`、`RichGraphic.kt` 共用正文/Ask 富媒体入口；`src/jvmSharedMain/kotlin/dev/wawlink/ui/RichGraphicDocument.kt` 负责离线图表文档、SVG 安全与图像加载。Android `RichGraphic.android.kt` 从精确 URL 拦截复用离线 Mermaid 引擎字节，由原生视图生命周期创建/释放 WebView，串行执行桥回执驱动的 SVG 栅格化，并处理渲染进程退出；Desktop `RichGraphic.desktop.kt` 保留内嵌引擎与无窗口 Canvas/原生图像显示。
   - 同目录的 `MarkdownInline.kt` 提供可选择、可点击的内联代码胶囊与长代码分段，`MarkdownTable.kt` 提供表格解析、统一列宽、对齐网格及窄屏横滚，`MarkdownTest.kt` 覆盖原文与链接偏移、转义竖线、缺格和无效表头边界。
   - 同目录的 `ImageDetailScreen.kt` 提供原生全屏图像、缩放拖动与保存；`RichGraphic.kt` 的 `LocalAgentImageSaveHandler` 由宿主接入系统文档保存，`RichGraphicDocument.kt` 保留校验后的图像字节、MIME 与安全文件名。
@@ -130,7 +137,7 @@
   - `src/commonMain/kotlin/dev/wawlink/ui/AgentChatScreen.kt` 使用原生 `SnapshotStateMap` 保存相对所属 Lazy 行的吸顶几何，普通滚动不再重写每个节点的坐标；候选只取可见根项，历史计划二分定位，吸顶观察隔离于聊天与输入区。保留有限距离追尾、三层吸顶及各层回跳，不通过结构相等的自定义 Map 包装几何状态。
   - `AgentChatScreen.kt` 的输入框上方错误栏按可识别故障提供模型、Agent 设置及可用的 OMP 修复入口；`src/commonTest/kotlin/dev/wawlink/ui/ChatErrorDiagnosisTest.kt` 覆盖诊断优先级、缺失模型与宿主能力边界。
   - 同目录的 `ErrorDetails.kt` 提供全应用共用的错误摘要、详情 Dialog 与入口，详情可滚动、选择、复制，统一脱敏常见凭据；`src/commonTest/kotlin/dev/wawlink/ui/ErrorDetailsRedactionTest.kt` 覆盖 Authorization、URL userinfo、含空格密码及 errno/路径保留。
-  - 同目录的 `SessionHistorySheet.kt` 实现历史树、时间线、回退、复制、预览、标签和历史 Ask；`AgentHubScreen.kt`、`SubagentScreen.kt` 实现运行总览、活动与独立子代理会话/概况/产物/任务页面；`AgentChatNavigation.kt` 保存跨页精确定位及返回请求，不用相同文本猜测原生节点。
+  - 同目录的 `SessionHistorySheet.kt` 实现历史树、时间线、回退、复制、预览、标签、历史 Ask 与按需全文查找；原生节点定位与聊天 Feed 消息定位使用独立入口，不混淆原生 ID 和显示 ID。`AgentHubScreen.kt`、`SubagentScreen.kt` 实现运行总览、活动与独立子代理会话/概况/产物/任务页面；`AgentChatNavigation.kt` 保存跨页精确定位及返回请求，不用相同文本猜测原生节点。
   - 同目录的 `ChatMessageActions.kt` 提供消息原文/Ask 全文复制、原生节点缺失刷新与独立快捷面板状态，隔离迟到定位、重复确认、导航取消和草稿恢复；`AgentChatNavigation.kt` 的操作栏直接写系统剪贴板并使用短暂对勾反馈。`src/desktopTest/kotlin/dev/wawlink/ui/ChatMessageActionsTest.kt` 覆盖完整 Markdown/空白/附件名复制、Ask 原生问题身份、冷索引/缺失节点、迟到回执、运行限制、取消和草稿/附件保留。
   - `Markdown.kt` 的大块拆分在有界后台队列执行，普通行独立重组、无内联代码时跳过子组合布局、无链接时跳过点击/布局观察；无待显示增量时平滑输出挂起。`MarkdownParts.kt` 的 `StableMarkdownBuffer` 仅保留已完成段落与扫描游标，不重复扫描未闭合围栏的旧行，不持有逐段 `StringBuilder` 或重复解析器。超长分隔线使用迭代识别，保留原文选择复制与富媒体安全边界。
   - 同目录的 `CodeLanguage.kt`、`HighlightedCode.kt`、`CodeDetailScreen.kt` 提供语言识别、后台高亮与全屏入口，以及默认开启的自动换行和三点菜单开关；`src/androidMain/kotlin/dev/wawlink/ui/OfflineTextMate.android.kt` 串行复用明/暗两套行内语法注册表，原生 Sora 编辑器仍独立持有分析器；`CodeDetailScreen.android.kt` 接入只读 Sora，`src/desktopMain/kotlin/dev/wawlink/ui/HighlightedCode.desktop.kt` 与 `CodeDetailScreen.desktop.kt` 接入 RSyntaxTextArea，全屏查看器沿用桌面混合画布以保证菜单位于原生编辑器上方。
@@ -149,8 +156,11 @@
   - 同资源目录的 `clawhub.ts`、`clawhub-http.ts`、`clawhub-source.ts` 提供独立 ClawHub 公开目录、精确版本与完整资源校验、受限联网及作用域安装；`.wawlink-clawhub.json` 只记录安装来源，不认证后续本地编辑内容。
   - `src/jvmSharedMain/kotlin/dev/wawlink/driver/OmpInstallation.kt` 提供容器内安装自检与终端命令，`src/jvmSharedMain/resources/omp-install.sh` 固定 OMP/Bun 来源和完整依赖，分阶段校验真实原生模块与 RPC 后切换安装；缺少 CA 的 APT 基础镜像先通过保留签名校验的临时 HTTP 源安装证书，不修改原软件源或关闭 TLS 校验。`OmpProcessPool.kt` 聚合会话及管理进程故障并暂停/恢复修复关联进程，`src/jvmSharedTest/kotlin/dev/wawlink/driver/OmpInstallationTest.kt` 覆盖引擎故障与缺失安装的区分及自检协议边界。
   - `src/jvmSharedMain/resources/omp-management/diagnostics.mjs` 统一原生配置诊断与敏感值清理，保留字段路径和可得语法位置，不转发源文本片段、凭据或 HTTP 响应正文。
+  - `src/jvmSharedMain/kotlin/dev/wawlink/driver/OmpContainerHistorySearch.kt` 按当前容器与传入会话元数据显式搜索客体历史，不创建聊天控制器；`omp-management/container-history-search.mjs` 纯读原生历史，不读取图片 Blob；`history-search.mjs` 共用完整文本匹配和命中片段，`attachment-prompts.mjs` 共用附件后缀解析。`src/jvmSharedTest/resources/container-history-search.test.mjs` 覆盖真实文件、精确身份、链接与读写并发边界；`explorer-attachments.test.mjs` 覆盖当前原生会话全文与分页快照。
   - `src/jvmSharedTest/kotlin/dev/wawlink/driver/OmpAgentManagementRepositoryTest.kt` 覆盖首屏与模型分阶段加载、无效模型配置修复、原生进程退出后恢复、目录分页完整性及 JSONL 大小/格式边界。
 - `container-runtime/`：三引擎、Rootfs、发行版、包管理与流式终端；`src/jvmSharedMain/kotlin/dev/wawlink/runtime/RuntimeDns.kt` 负责边界安全的原子 DNS 更新，`src/jvmSharedTest/kotlin/dev/wawlink/runtime/RuntimeDnsTest.kt` 覆盖链接边界与配置切换。
+  - `DistroSources.kt` 的传输控制撤销实际元数据和归档连接，`LocalContainerRuntime.kt` 以操作身份管理下载取消、失败原参数重试及清理，提交阶段保护已注册容器；`src/jvmSharedTest/kotlin/dev/wawlink/runtime/DistroDeploymentTest.kt` 覆盖真实本机 HTTP 取消、重复操作、原参数重试与失败清除。
+  - `ContainerContract.kt` 的 `closeProcess` 提供指定命令清理；`LocalContainerRuntime.kt` 在销毁引擎或 `su` 句柄前保留 PID/starttime 身份，仅回收该命令和已跟踪后代，Root 快照与有界 TERM/KILL 等待位于全局锁外，失败保留身份供重试，不启停容器、不影响 keeper 或其他会话。`src/jvmSharedTest/kotlin/dev/wawlink/runtime/LocalContainerRuntimeTest.kt` 覆盖真实进程树、慢快照并发、错误容器和 keeper 拒绝，以及模拟 Root 身份通道下的独立 launcher/worker、权限失败与重试；不代替 Android Root 或 SELinux 验收。
   - 同目录的 `DistroSources.kt` 负责官方/国内 Rootfs 路由、完整性校验、同站 HTTPS 重定向及客体软件源与安装来源记录；`src/jvmSharedTest/kotlin/dev/wawlink/runtime/DistroSourcesTest.kt` 覆盖快照选择、错误校验值、国内源不外逃与软件源边界。`RootfsArchives.kt` / `RootfsArchivesTest.kt` 同时保留 Linux systemd 文件名中的字面反斜杠及链接目标，不放宽目录穿越保护。
   - `RootfsSanitizer.kt` 按容器用户 HOME、原生配置档和选项过滤归档中的配置、日志、历史、凭据及缓存；`src/jvmSharedTest/kotlin/dev/wawlink/runtime/RootfsExportSanitizationTest.kt` 覆盖各选项、源文件保留、链接和越界拒绝。
   - 同目录的 `RootfsOwnershipModel.kt` 定义逻辑 UID/GID、完整模式及可恢复迁移记录；`RootfsOwnershipRules.kt` 为无历史元数据容器提供多账户/HOME、系统和明确私有路径的一次性保守重建。`RootfsOwnership.kt` 管理私有 sidecar、真实挂载隔离、整树零写入预检、有界多路径 stat 扫描、同父目录/属主/模式的批量迁移与 journal 恢复；支持原生 `find -printf` 时批量读取链接目标并按 inode 复核，不支持时使用有界 stat/readlink，保留完整元数据、完成标记、每批前后校验及真实迁移进度。`RootfsOwnershipArchive.kt` 为 chroot 私有树提供可回收 Root tar 流，保留脱敏及硬链接过滤。`RootfsArchiveOwnershipTest.kt`、`RootfsOwnershipRulesTest.kt`、`RootfsOwnershipTest.kt` 和 `RootfsOwnershipLifecycleTest.kt` 覆盖归档 UID/GID/07777、完整快照与批次边界、链接目标原文与替换/部分输出拒绝、启发式、拒绝与恢复、同批成员置换、引擎切换及导出/克隆/覆盖/删除。
@@ -177,6 +187,7 @@
   - `src/jvmSharedTest/kotlin/dev/wawlink/runtime/ContainerFeatureDebugTest.kt` 覆盖通道认证及网页来源拒绝、跨容器令牌隔离、重复挂载歧义、卡片/内页隔离、停止/删除/重启旧身份拒绝与销毁取消；真实执行生产发现、安装器和直接 CLI，覆盖无 Bun 后同代次重试、PATH/用户/自定义/传统路径、路径优先级与运行时更新、损坏及不可执行运行时、发现中停止/快速重启，以及 root 异主接管、非 root 拒绝、共享 setgid 保留及软/硬链接边界。跨 UID/GID 元数据及 chown 由夹具显式模拟，文件模式、链接和 HTTP 真实执行，不冒充特权内核、Android 或 WebView 验收。
   - `ContainerFeatures.kt` 的 `prepareContainerFeatureSupport` 独立尝试 Skill 与调试器，`ContainerFeatureDebug.kt` 将准确分类的安装错误交给已有功能服务；`OmpProcessPool.kt` 不再以辅助安装成功作为聊天启动条件。`OmpPromptDeliveryTest.kt` 覆盖调试运行时缺失及两类安装失败下继续原生发送和配置重载、真实原生错误保留、停止取消与迟到回执隔离；`OmpAgentManagementRepository.kt` 无此辅助依赖，保持原生配置错误语义。
 - `app-desktop/`：460 × 920 桌面宿主；`src/desktopMain/kotlin/dev/wawlink/app/Main.kt` 使用 JFrame/ComposePanel 的混合画布，保证嵌入 HTML 卡片的裁剪、拖动和原生弹层层级；`src/sharedMain/kotlin/` 为双端共用主页与应用协调层。
+  - `src/sharedMain/kotlin/dev/wawlink/app/SessionDraftStore.kt` 提供已有会话草稿的私有原子存储，内存与磁盘锁分离、版本化拒绝迟到提交；`AppCoordinator.kt` 同时持有跨页面和 Activity 重建的输入状态注册表，在会话删除、空会话丢弃及关闭时释放条目。`SessionReadinessScreen.kt` 提供容器、OMP、原生默认模型的连续准备和真实部署操作；`ContainerHistorySearchScreen.kt` 提供当前容器跨会话全文搜索和按原生身份定位；`TaskNotificationNavigation.kt` 隔离通知请求与当前可见会话。`src/desktopTest/kotlin/dev/wawlink/app/SessionDraftStoreTest.kt`、`SessionReadinessTest.kt` 覆盖慢盘、删除、重启和默认身份边界，不冒充界面或真机验收。
   - 同共享目录的 `ContainerScreens.kt` 提供 `ContainerOperationProgress`，容器列表、详情及导入页共用标准阶段/比例进度；`EngineOwnershipConversionDialog` 在跨 chroot 选择前解释物理属主转换，由详情页分别提交开始/暂缓选择，取消保持原引擎，防止重复提交和过期选择。`AppCoordinator.kt` 的 `HostNotice` 保留摘要与诊断，`hostErrorDetails` 有界捕获 cause/suppressed 异常链供共用详情组件查看，不附加命令参数或环境。
   - `src/sharedMain/kotlin/dev/wawlink/app/TerminalScreen.kt` 为独立终端导航页，支持一次性授权的 OMP 安装初始命令及离开后的自检刷新；`src/desktopMain/kotlin/dev/wawlink/app/TerminalSurface.desktop.kt` 提供 JediTerm 终端，`src/desktopMain/resources/licenses/` 随桌面分发保留 JediTerm 与 pty4j 许可。`container-runtime/src/jvmSharedTest/kotlin/dev/wawlink/runtime/TerminalInitialCommandTest.kt` 覆盖初始命令与失败后交互式终端保留。
   - `src/sharedMain/kotlin/dev/wawlink/app/ContainerMetadataSheet.kt` 提供容器详情编辑 bottom sheet、图标选择、草稿及冲突确认和统一 `ContainerAvatar`；`src/desktopMain/kotlin/dev/wawlink/app/ContainerIconImage.desktop.kt` 与 `app-android/src/main/kotlin/dev/wawlink/app/ContainerIconImage.android.kt` 使用原生图片解码器缩放并编码 PNG，两端 `HostFiles.pickContainerIcon` 接入单张系统图片选择。
@@ -194,6 +205,7 @@
   - `AppCoordinator.kt` 持久化后台保活偏好并独立保存临时运行状态；`AppCoordinatorAppearanceTest.kt` 覆盖保活选项跨重启及其他设置写回后的保持。
   - `src/desktopTest/kotlin/dev/wawlink/app/AppCoordinatorInterruptionTest.kt` 覆盖 OMP 自检中断、旧修复提示过期、跨容器代次的终端安装授权失效，以及启动/功能目录无 Bun 不产生错误 Notice、真实辅助安装失败保留诊断且不误触发 OMP 修复；驱动与功能运行时回归同时覆盖快速重启、启动中取消、迟到进程和真实故障提示。
 - `app-android/`：仅 arm64-v8a 的 Android 宿主、系统文件选择和后台会话保活；Rootfs 通过容器页单独导入。
+  - `src/main/kotlin/dev/wawlink/app/SessionTaskNotifications.kt` 观察已有主会话的真实任务状态，按会话身份发送独立通知、脱敏显示并抑制当前可见会话；`src/test/kotlin/dev/wawlink/app/SessionTaskNoticeTrackerTest.kt` 覆盖完成、错误、Ask、审批与会话隔离，不修改前台服务契约。
   - `src/main/kotlin/dev/wawlink/app/TerminalSurface.android.kt` 将共享终端会话接入移植的 Android TerminalView，保留 Love2Droid 原快捷键布局与输入焦点；`src/main/res/font/maple_mono_nf_cn_regular.ttf` 保存原项目终端字体。
   - `src/main/kotlin/dev/wawlink/app/MainActivity.kt` 提供系统打开、下载、APK 安装及主机挂载目录选择，按 Android 版本处理共享储存授权与本机储存卷路径，并按前台生命周期应用屏幕常亮偏好；`src/main/res/xml/file_paths.xml` 仅共享应用缓存中的暂存文件，Manifest 使用非导出的 FileProvider 与临时 URI 读取授权。
   - `ContainerForegroundService.kt` 按用户设置管理前台服务、CPU/Wi-Fi 锁与静音音频，创建及每条启动命令先满足前台契约，并重建当前状态观察以避免快速切换被合并后漏释放/漏停服；按最新 startId 和空闲宽限自管停服。`WawLinkApplication.kt` 观察统一活动状态，合并待确认启动与当前实例，不发送交叉停止 IPC。`MainActivity.kt` 提供电池优化及厂商自启动设置入口并回退系统设置。

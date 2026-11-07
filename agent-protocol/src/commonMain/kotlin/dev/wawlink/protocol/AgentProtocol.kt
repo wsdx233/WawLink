@@ -10,6 +10,9 @@ interface AgentSessionController {
     fun sendPrompt(text: String, attachments: List<AttachmentFile> = emptyList())
     /** Dismisses the current error without changing execution state; durable errors must stay dismissed on replay. */
     fun dismissError() {}
+    /** Atomically takes a rejected message for editing; accepted messages cannot be recovered or retried. */
+    suspend fun takeFailedPrompt(id: String): RestoredSessionPrompt = error("当前会话不支持取回发送内容")
+    suspend fun retryFailedPrompt(id: String) { error("当前会话不支持重新发送") }
     fun stopExecution()
     /** Queues a follow-up behind the current execution, including its attachments. */
     fun enqueuePrompt(text: String, attachments: List<AttachmentFile> = emptyList())
@@ -68,6 +71,8 @@ data class WorkspaceFileItem(val name: String, val relativePath: String, val isD
 enum class PromptQueue(val wireName: String) { STEERING("steering"), FOLLOW_UP("followUp") }
 data class QueuedPrompt(val id: String, val text: String, val attachments: List<AttachmentFile> = emptyList(),
     val queue: PromptQueue = PromptQueue.FOLLOW_UP)
+data class FailedPrompt(val id: String, val text: String, val attachments: List<AttachmentFile> = emptyList(),
+    val queue: PromptQueue = PromptQueue.STEERING, val retryable: Boolean = true)
 data class AgentSlashCommand(val name: String, val source: String, val aliases: List<String> = emptyList())
 data class UsageInfo(
     val inputTokens: Long = 0,
@@ -108,6 +113,7 @@ data class ChatSessionUiState(
     val slashCommands: List<AgentSlashCommand> = emptyList(),
     val slashCommandsLoading: Boolean = false,
     val slashCommandsError: String? = null,
+    val failedPrompts: List<FailedPrompt> = emptyList(),
 ) {
     val isRunning: Boolean get() = status == SessionStatus.RUNNING || status == SessionStatus.WAITING
 }

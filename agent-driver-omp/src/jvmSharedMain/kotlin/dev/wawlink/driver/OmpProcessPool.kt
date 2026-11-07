@@ -244,7 +244,7 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
     }
 
     @Synchronized
-    fun management(containerId: String, workspace: String? = null, sessionId: String? = null): AgentManagementRepository {
+    fun management(containerId: String, workspace: String? = null, sessionId: String? = null, loadInitially: Boolean = true): AgentManagementRepository {
         check(!closed)
         val project = workspace?.let(::normalizeGuest)
         val configuration = config(containerId)
@@ -263,8 +263,9 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
                 pins = { if (selected?.managementAvailable() == true) selected.managementControl("pins")["pins"]?.jsonObject?.mapValues { it.value.jsonPrimitive.content }.orEmpty() else emptyMap() },
                 applyDefault = { role -> selected?.applyManagementDefault(role) },
                 runtimeFailure = { generation, message -> reportRuntimeIssue(containerId, generation, message) },
+                loadInitially = loadInitially,
             )
-        }
+        }.also { if (loadInitially) it.ensureLoaded() }
     }
 
     /** Resource discovery owns a separate bridge so model/OAuth SDK work cannot block its first screen. */
@@ -581,7 +582,7 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             if (!disposed) actions.trySend(action)
         }
 
-        override fun sendPrompt(text: String, attachments: List<AttachmentFile>) = admitPrompt(text, attachments, PromptQueue.STEERING)
+        override fun sendPrompt(text: String, attachments: List<AttachmentFile>) { admitPrompt(text, attachments, PromptQueue.STEERING) }
 
         override fun dismissError() {
             val displayedError = state.value.error ?: return
@@ -597,12 +598,31 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             }
         }
 
-        override fun enqueuePrompt(text: String, attachments: List<AttachmentFile>) = admitPrompt(text, attachments, PromptQueue.FOLLOW_UP)
+        override fun enqueuePrompt(text: String, attachments: List<AttachmentFile>) { admitPrompt(text, attachments, PromptQueue.FOLLOW_UP) }
 
-        private fun admitPrompt(text: String, attachments: List<AttachmentFile>, queue: PromptQueue) {
-            if (text.isBlank() && attachments.isEmpty()) return
+        override suspend fun takeFailedPrompt(id: String): RestoredSessionPrompt = stateMutex.withLock {
+            val prompt = reducer.state.failedPrompts.firstOrNull { it.id == id }
+                ?: error("发送内容已取回或已被接收")
+            check(!reducer.hasConfirmedUser(id)) { "消息已被接收，不能重复发送" }
+            recordLocal(buildJsonObject { put("action", "failed_prompt_removed"); put("promptId", id) })
+            RestoredSessionPrompt(prompt.text, prompt.attachments)
+        }
+
+        override suspend fun retryFailedPrompt(id: String) = stateMutex.withLock {
+            val prompt = reducer.state.failedPrompts.firstOrNull { it.id == id }
+                ?: error("发送内容已取回或已被接收")
+            check(!disposed) { "会话已关闭" }
+            check(!reducer.hasConfirmedUser(id)) { "消息已被接收，不能重复发送" }
+            check(prompt.retryable) { "发送结果尚未确认，请先核对会话历史，避免重复发送" }
+            // Admit the replacement before removing the recovery entry. A failed retry gets its own stable ID.
+            check(admitPrompt(prompt.text, prompt.attachments, prompt.queue)) { "会话已关闭，请重新进入后重试" }
+            recordLocal(buildJsonObject { put("action", "failed_prompt_removed"); put("promptId", id) })
+        }
+
+        private fun admitPrompt(text: String, attachments: List<AttachmentFile>, queue: PromptQueue): Boolean {
+            if (text.isBlank() && attachments.isEmpty()) return false
             synchronized(presentationLock) {
-                if (disposed) return
+                if (disposed) return false
                 val position = outgoingPrompts.values.lastOrNull {
                     it.preview && !it.queued && it.position.groupId == backendUserPosition.groupId
                 }?.let { backendUserPosition.copy(afterId = it.id) } ?: backendUserPosition
@@ -614,7 +634,9 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
                 if (actions.trySend { deliverPrompt(prompt) }.isFailure) {
                     outgoingPrompts.remove(prompt.id)
                     presentState()
+                    return false
                 }
+                return true
             }
         }
 
@@ -1138,7 +1160,7 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             prepareOmpConfiguration(files, guestAgentDirectory(containerId))
             args += listOf("--extension", ModelPayloadExtension.install(files, guestAgentDirectory(containerId)))
             files.mkdirs("${guestAgentDirectory(containerId)}/wawlink/management")
-            for (module in listOf("session.mjs", "diagnostics.mjs", "explorer.mjs", "explorer-runtime.mjs", "explorer-history.mjs")) {
+            for (module in listOf("session.mjs", "diagnostics.mjs", "explorer.mjs", "explorer-runtime.mjs", "explorer-history.mjs", "history-search.mjs", "attachment-prompts.mjs")) {
                 val destination = "${guestAgentDirectory(containerId)}/wawlink/management/$module"
                 val source = requireNotNull(javaClass.getResourceAsStream("/omp-management/$module")).bufferedReader().use { it.readText() }
                 if (files.readText(destination) != source) files.writeText(destination, source)
@@ -1383,7 +1405,7 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
                 put("action", "elapsed"); put("seconds", ((System.nanoTime() - startedNanos) / 1_000_000_000).toInt())
             })
             if (type == "response") {
-                if (frame["success"]?.jsonPrimitive?.booleanOrNull == false) rejectPrompt(frame.string("id"), frame.string("error", "OMP 请求失败"))
+                if (frame["success"]?.jsonPrimitive?.booleanOrNull == false) rejectPrompt(frame.string("id"), frame.string("error", "OMP 请求失败"), confirmedRejection = true)
                 else if (frame.string("command") == "follow_up" || frame.string("command") == "steer") completePrompt(frame.string("id"))
                 else if (frame.string("command") == "prompt" && frame["data"]?.jsonObject?.get("agentInvoked")?.jsonPrimitive?.booleanOrNull == false) {
                     completePrompt(frame.string("id"))
@@ -1394,7 +1416,7 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             }
             if (type == "prompt_result") {
                 if (frame["agentInvoked"]?.jsonPrimitive?.booleanOrNull == false && frame.string("status") == "error") {
-                    rejectPrompt(frame.string("id"), frame["error"]?.jsonObject?.string("message", "消息发送失败") ?: "消息发送失败")
+                    rejectPrompt(frame.string("id"), frame["error"]?.jsonObject?.string("message", "消息发送失败") ?: "消息发送失败", confirmedRejection = true)
                 } else completePrompt(frame.string("id"))
             }
             if (type == "ready") { hasStartedRpc = true; attempt.nativeReady = true; attempt.ready.complete(frame) }
@@ -1528,11 +1550,13 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             if (outgoingPrompts.remove(id) != null) presentState()
         }
 
-        private suspend fun rejectPrompt(id: String, message: String) = stateMutex.withLock {
-            synchronized(presentationLock) { outgoingPrompts.remove(id) } ?: return@withLock
+        private suspend fun rejectPrompt(id: String, message: String, confirmedRejection: Boolean = false) = stateMutex.withLock {
+            val prompt = synchronized(presentationLock) { outgoingPrompts.remove(id) } ?: return@withLock
             recordLocal(buildJsonObject {
                 put("action", if (reducer.hasConfirmedUser(id)) "operation_error" else "prompt_failed")
                 put("promptId", id); put("message", message); put("settled", backendSettled)
+                put("text", prompt.text); put("attachments", attachmentsJson(prompt.attachments)); put("queue", prompt.queue.wireName)
+                put("retryable", !prompt.dispatching || confirmedRejection)
             })
         }
 
@@ -1565,6 +1589,9 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
             val type = frame.string("type")
             if (type == "agent_start") dismissedRunError = null
             reducer.reduce(frame)
+            if (reducer.state.failedPrompts.isNotEmpty()) reducer.update { current ->
+                current.copy(failedPrompts = current.failedPrompts.filterNot { reducer.hasConfirmedUser(it.id) })
+            }
             // A run's terminal frames can repeat the error already dismissed mid-run.
             val repeatsRunError = type == "agent_end" || type == "session_settled" ||
                 (type == "prompt_result" && frame["agentInvoked"]?.jsonPrimitive?.booleanOrNull != false)
@@ -1595,7 +1622,13 @@ class OmpProcessPool(val runtime: ContainerRuntime, val dataDir: File, private v
                     queuedPrompts = it.queuedPrompts.filterNot { queued -> queued.id == frame.string("promptId") },
                     status = if (frame["settled"]?.jsonPrimitive?.booleanOrNull == true) SessionStatus.ERROR else it.status,
                     actionText = if (frame["settled"]?.jsonPrimitive?.booleanOrNull == true) "发送失败" else it.actionText,
-                    error = frame.string("message")) }
+                    error = frame.string("message"),
+                    failedPrompts = if (frame["text"] == null || reducer.hasConfirmedUser(frame.string("promptId"))) it.failedPrompts else
+                        it.failedPrompts.filterNot { failed -> failed.id == frame.string("promptId") } +
+                            FailedPrompt(frame.string("promptId"), frame.string("text"), parseAttachments(frame["attachments"]),
+                                PromptQueue.entries.firstOrNull { queue -> queue.wireName == frame.string("queue") } ?: PromptQueue.STEERING,
+                                retryable = frame["retryable"]?.jsonPrimitive?.booleanOrNull != false)) }
+                "failed_prompt_removed" -> reducer.update { it.copy(failedPrompts = it.failedPrompts.filterNot { prompt -> prompt.id == frame.string("promptId") }) }
                 "queue_add" -> {
                     val position = frame["position"] as? JsonObject
                     val prompt = localAttachmentPrompt(frame, frame.string("queueId"))

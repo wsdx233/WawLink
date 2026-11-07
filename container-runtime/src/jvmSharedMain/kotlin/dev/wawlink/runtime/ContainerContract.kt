@@ -1,7 +1,11 @@
 package dev.wawlink.runtime
 
 import java.io.File
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -45,7 +49,8 @@ data class ContainerInfo(
     val stopGeneration: Long = 0,
 )
 /** Null progress means the current phase has no measurable total; never synthesize a percentage. */
-data class DeploymentProgress(val id: String, val name: String, val progress: Float?, val phase: String, val error: String? = null)
+data class DeploymentProgress(val id: String, val name: String, val progress: Float?, val phase: String, val error: String? = null,
+    val cancellable: Boolean = false, val retryable: Boolean = false)
 enum class MirrorSource(val label: String) { OFFICIAL("官方源"), TSINGHUA("清华镜像"), ALIYUN("阿里镜像"), USTC("中科大镜像") }
 data class DistroSpec(val id: String, val name: String, val version: String, val arch: String = "arm64", val icon: String = "deployed_code")
 data class ToolchainInfo(val id: String, val title: String, val icon: String, val installed: Boolean, val version: String = "")
@@ -99,6 +104,9 @@ interface ContainerRuntime : AutoCloseable {
     suspend fun clone(id: String, name: String): ContainerConfig
     suspend fun setDefault(id: String)
     suspend fun installDistro(distro: DistroSpec, name: String, mirror: MirrorSource, engine: ContainerEngineType): ContainerConfig
+    suspend fun cancelDeployment(id: String)
+    suspend fun retryDistroDeployment(id: String): ContainerConfig
+    suspend fun dismissDeployment(id: String)
     suspend fun inspectRootfsArchive(source: String, name: String, engine: ContainerEngineType = ContainerEngineType.PROOT, expectedSha256: String? = null, onProgress: (DeploymentProgress) -> Unit = {}): RootfsImportInspection
     suspend fun importRootfs(inspectionId: String, name: String, mode: RootfsImportMode = RootfsImportMode.NEW, targetId: String? = null, onProgress: (DeploymentProgress) -> Unit = {}): ContainerConfig
     suspend fun discardRootfsImport(inspectionId: String)
@@ -110,6 +118,14 @@ interface ContainerRuntime : AutoCloseable {
     suspend fun openProcess(id: String, arguments: List<String>, cwd: String = "/workspace", environment: Map<String, String> = emptyMap()): Process
     /** Checks running state and launches atomically with respect to stop; never starts a stopped container. */
     suspend fun openRunningProcess(id: String, arguments: List<String>, cwd: String = "/workspace", environment: Map<String, String> = emptyMap()): Process
+    /** Reclaims only this command and its owned descendants; never stops or starts its container. */
+    suspend fun closeProcess(id: String, process: Process): Unit = withContext(NonCancellable + Dispatchers.IO) {
+        // Lightweight runtimes and fixtures may own only a raw Process. LocalContainerRuntime
+        // overrides this to preserve the real guest identity behind an engine or su launcher.
+        if (process.isAlive) process.destroy()
+        if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
+        check(process.waitFor(2, TimeUnit.SECONDS)) { "容器命令未能退出" }
+    }
     /** Runs an optional trusted script once via /bin/sh, then keeps the configured interactive shell open. */
     suspend fun openTerminal(id: String, initialCommand: String? = null): TerminalSession
     suspend fun register(config: ContainerConfig)

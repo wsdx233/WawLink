@@ -77,6 +77,31 @@ class OmpAgentManagementRepositoryTest {
         }
     }
 
+    @Test fun cancelledReadinessCatalogueStopsLoadingAndNextExplicitConsumerCanResume() = runBlocking {
+        fixture(loadInitially = false) {
+            val load = async { repository.reload() }
+            val first = connect()
+            first.respond(first.request("snapshot"), configuration)
+            first.request("modelsSnapshot")
+            awaitState { !it.loading && it.modelsLoading }
+            load.cancelAndJoin()
+            val cancelled = awaitState { !it.loading && !it.modelsLoading && it.modelsError != null }
+            assertTrue(cancelled.modelsError!!.contains("已取消"))
+            assertTrue(load.isCancelled)
+            assertFalse(first.isAlive)
+            assertTrue(runtimeFailures.isEmpty())
+            repository.ensureLoaded()
+            val replacement = connect()
+            replacement.respond(replacement.request("snapshot"), configuration)
+            replacement.respond(replacement.request("modelsSnapshot"), catalogueResult)
+            val restored = awaitState { !it.modelsLoading && it.models.singleOrNull()?.id == "chat" }
+            assertNull(restored.error)
+            assertNull(restored.modelsError)
+            assertEquals("local/chat", restored.roles.single().model)
+            assertTrue(uncaught.isEmpty(), uncaught.toString())
+        }
+    }
+
     @Test fun failedBasicSnapshotTerminatesLoadingAndCanRetryOnSameProcess() = runBlocking {
         fixture {
             val transport = connect()

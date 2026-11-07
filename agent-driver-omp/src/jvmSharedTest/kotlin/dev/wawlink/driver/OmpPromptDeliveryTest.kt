@@ -273,12 +273,97 @@ class OmpPromptDeliveryTest {
             val failed = awaitState { it.error?.contains("容器启动被拒绝") == true }
             assertTrue(failed.feed.none { it.id == id })
             assertEquals(SessionStatus.ERROR, failed.status)
+            assertEquals(listOf(FailedPrompt(id, "无法启动的消息")), failed.failedPrompts)
             pool.close()
             pool = OmpProcessPool(runtime, data)
             val restored = withTimeout(5_000) {
                 pool.session("session", "fixture", "/workspace").state.first { it.error?.contains("容器启动被拒绝") == true }
             }
             assertTrue(restored.feed.none { it.id == id })
+            assertEquals(failed.failedPrompts, restored.failedPrompts)
+        }
+    }
+
+    @Test fun failedSendRecoveryPreservesWhitespaceAndAttachmentsAndIsTakenOnlyOnce() = runBlocking {
+        fixture {
+            val missing = AttachmentFile("missing", "缺失文件.txt", File(data, "does-not-exist").absolutePath)
+            controller.sendPrompt(" \n  ", listOf(missing))
+            val failed = awaitState { it.failedPrompts.isNotEmpty() }
+            val prompt = failed.failedPrompts.single()
+            assertEquals(" \n  ", prompt.text)
+            assertEquals(listOf(missing), prompt.attachments)
+            controller.dismissError()
+            awaitState { it.error == null }
+            assertEquals(RestoredSessionPrompt(" \n  ", listOf(missing)), controller.takeFailedPrompt(prompt.id))
+            assertTrue(controller.state.value.failedPrompts.isEmpty())
+            assertFailsWith<IllegalStateException> { controller.takeFailedPrompt(prompt.id) }
+            pool.close()
+            pool = OmpProcessPool(runtime, data)
+            val restored = withTimeout(5_000) { pool.session("session", "fixture", "/workspace").state.first { !it.modelLoading } }
+            assertTrue(restored.failedPrompts.isEmpty())
+        }
+    }
+
+    @Test fun failedSendRetryPreservesFollowUpKindAndDoesNotConsumeAnotherFailure() = runBlocking {
+        fixture {
+            val firstFile = File(data, "first.txt")
+            val secondFile = File(data, "second.txt")
+            val firstAttachment = AttachmentFile("first", "first.txt", firstFile.absolutePath)
+            val secondAttachment = AttachmentFile("second", "second.txt", secondFile.absolutePath)
+            controller.enqueuePrompt("重试追加", listOf(firstAttachment))
+            val firstFailure = awaitState { it.failedPrompts.size == 1 }.failedPrompts.single()
+            controller.sendPrompt("保留另一条", listOf(secondAttachment))
+            awaitState { it.failedPrompts.size == 2 }
+            firstFile.writeText("真实内容")
+            gate.complete(transport)
+            controller.retryFailedPrompt(firstFailure.id)
+            val request = transport.request()
+            assertEquals("followUp", request.string("streamingBehavior"))
+            assertEquals(listOf("保留另一条"), controller.state.value.failedPrompts.map { it.text })
+            assertFailsWith<IllegalStateException> { controller.retryFailedPrompt(firstFailure.id) }
+            transport.acceptUser(request)
+            transport.respond(request)
+            transport.finish(request)
+            val done = awaitState { it.status == SessionStatus.DONE }
+            assertEquals(listOf("重试追加"), done.feed.filterIsInstance<UserMessageItem>().map { it.text })
+            assertEquals(listOf("保留另一条"), done.failedPrompts.map { it.text })
+        }
+    }
+
+    @Test fun failedSendWithUncertainPipeDeliveryCannotBeBlindlyRetried() = runBlocking {
+        fixture {
+            gate.complete(transport)
+            controller.sendPrompt("已完成的请求")
+            val first = transport.request()
+            transport.acceptUser(first)
+            transport.respond(first)
+            transport.finish(first)
+            awaitState { it.status == SessionStatus.DONE }
+            transport.failWrites = true
+            controller.sendPrompt("投递结果待确认")
+            val failed = awaitState { it.failedPrompts.isNotEmpty() }.failedPrompts.single()
+            assertFalse(failed.retryable)
+            assertFailsWith<IllegalStateException> { controller.retryFailedPrompt(failed.id) }
+            assertEquals(listOf(failed), controller.state.value.failedPrompts)
+            assertEquals(RestoredSessionPrompt("投递结果待确认"), controller.takeFailedPrompt(failed.id))
+        }
+    }
+
+    @Test fun failedSendLateNativeAdmissionClearsRecoveryAndKeepsTheOriginalIdentity() = runBlocking {
+        fixture {
+            gate.complete(transport)
+            controller.sendPrompt("首个请求")
+            val first = transport.request()
+            transport.acceptUser(first); transport.respond(first); transport.finish(first)
+            awaitState { it.status == SessionStatus.DONE }
+            transport.failWrites = true
+            controller.sendPrompt("迟到接收的原文")
+            val failed = awaitState { it.failedPrompts.isNotEmpty() }.failedPrompts.single()
+            transport.acceptUser(buildJsonObject { put("id", failed.id); put("message", failed.text) })
+            val accepted = awaitState { it.failedPrompts.isEmpty() && it.feed.filterIsInstance<UserMessageItem>().any { user -> user.id == failed.id && user.accepted } }
+            assertEquals(listOf("首个请求", failed.text), accepted.feed.filterIsInstance<UserMessageItem>().map { it.text })
+            assertFailsWith<IllegalStateException> { controller.takeFailedPrompt(failed.id) }
+            assertFailsWith<IllegalStateException> { controller.retryFailedPrompt(failed.id) }
         }
     }
 
@@ -364,6 +449,7 @@ class OmpPromptDeliveryTest {
             val failed = awaitState { it.status == SessionStatus.ERROR }
             assertEquals("模型服务不可用", failed.error)
             assertEquals(listOf(optimistic.copy(accepted = true)), failed.feed.filterIsInstance<UserMessageItem>())
+            assertTrue(failed.failedPrompts.isEmpty())
             assertTrue(pool.runtimeIssues.value.isEmpty())
         }
     }

@@ -77,16 +77,19 @@ class MainActivity : ComponentActivity(), HostFiles {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        val app = (application as WawLinkApplication).coordinator
+        val owner = application as WawLinkApplication
+        val app = owner.coordinator
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 try {
+                    launch { navigation.taskSessions.visibleSession.collect(owner.sessionTaskNotifications::showSession) }
                     app.keepScreenOn.collect { enabled ->
                         if (enabled) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                         else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                     }
                 } finally {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                    owner.sessionTaskNotifications.showSession(null)
                 }
             }
         }
@@ -114,7 +117,21 @@ class MainActivity : ComponentActivity(), HostFiles {
                 )
             ) { WawLinkApp(app, this@MainActivity, navigation) }
         }
+        takeTaskNotificationIntent(intent)
         if (Build.VERSION.SDK_INT >= 33 && savedInstanceState == null) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        takeTaskNotificationIntent(intent)
+    }
+    private fun takeTaskNotificationIntent(intent: Intent?) {
+        SessionTaskNotifications.sessionFrom(intent)?.let(navigation.taskSessions::openSession)
+        if (intent?.action == SessionTaskNotifications.OPEN_SESSION) {
+            intent.action = Intent.ACTION_MAIN
+            intent.removeExtra(SessionTaskNotifications.SESSION_ID)
+            intent.data = null
+        }
     }
     override fun onResume() {
         super.onResume()

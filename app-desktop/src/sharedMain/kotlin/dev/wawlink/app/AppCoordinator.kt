@@ -5,6 +5,7 @@ import dev.wawlink.driver.OmpInstallation
 import dev.wawlink.driver.OmpInstallationState
 import dev.wawlink.protocol.*
 import dev.wawlink.runtime.*
+import dev.wawlink.ui.ComposerDraftRegistry
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -102,6 +103,8 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val persistenceLock = Any()
     private val records = MutableStateFlow<List<SessionRecord>>(emptyList())
+    internal val drafts = SessionDraftStore(dataDir, { id -> records.value.any { it.id == id } && id !in provisionalSessions }, ::showError)
+    internal val composerDrafts = ComposerDraftRegistry()
     private val sessionStates = MutableStateFlow<Map<String, ChatSessionUiState>>(emptyMap())
     private val controllers = mutableMapOf<String, AgentSessionController>()
     private val observers = mutableMapOf<String, Job>()
@@ -118,6 +121,8 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
     val defaultAutoApprove: StateFlow<Boolean> = _defaultAutoApprove.asStateFlow()
     private val _keepScreenOn = MutableStateFlow(false)
     val keepScreenOn: StateFlow<Boolean> = _keepScreenOn.asStateFlow()
+    private val _taskNotifications = MutableStateFlow(true)
+    val taskNotifications: StateFlow<Boolean> = _taskNotifications.asStateFlow()
     private val _keepAlive = MutableStateFlow(KeepAliveSettings())
     val keepAlive: StateFlow<KeepAliveSettings> = _keepAlive.asStateFlow()
     private val _keepAliveStatus = MutableStateFlow(KeepAliveStatus())
@@ -164,6 +169,7 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
             )
             _defaultAutoApprove.value = flag("defaultAutoApprove", true)
             _keepScreenOn.value = flag("keepScreenOn", false)
+            _taskNotifications.value = flag("taskNotifications", true)
             _keepAlive.value = KeepAliveSettings(
                 enabled = flag("keepAlive.enabled", false),
                 wakeLock = flag("keepAlive.wakeLock", false),
@@ -240,6 +246,12 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
         return installed
     }
 
+    suspend fun retryDistroDeployment(id: String): ContainerConfig {
+        val installed = runtime.retryDistroDeployment(id)
+        checkOmpInstallation(installed.id)
+        return installed
+    }
+
     internal suspend fun checkOmpInstallation(containerId: String) {
         val generation = runtime.containers.value.firstOrNull { it.config.id == containerId }?.stopGeneration ?: return
         val check = try { OmpInstallation.inspect(runtime, containerId, stopGeneration = generation) }
@@ -256,6 +268,12 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
 
     internal fun requestOmpInstallation(containerId: String) {
         offerOmpSetup(OmpSetupRequest(containerId = containerId, message = "可重新安装 OMP 及其运行依赖。", repair = true))
+    }
+
+    internal fun requestOmpInstallation(containerId: String, check: dev.wawlink.driver.OmpInstallationCheck) {
+        val generation = runtime.containers.value.firstOrNull { it.config.id == containerId }?.stopGeneration ?: return
+        offerOmpSetup(OmpSetupRequest(containerId = containerId, message = check.message,
+            repair = check.state == OmpInstallationState.BROKEN, stopGeneration = generation))
     }
 
     private fun offerOmpSetup(request: OmpSetupRequest) = synchronized(ompSetupLock) {
@@ -393,6 +411,8 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
             controllers.remove(id)
             records.update { all -> all.filterNot { it.id == id } }
             sessionStates.update { it - id }
+            drafts.discard(id)
+            composerDrafts.discard(id)
         }
         launch { pool.deleteSession(id); persistSessions() }
     }
@@ -546,6 +566,8 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
             backgroundDrafts.remove(id)
             records.update { all -> all.filterNot { it.id == id } }
             sessionStates.update { it - id }
+            drafts.discard(id)
+            composerDrafts.discard(id)
             persistSessions()
         }
     }
@@ -565,6 +587,10 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
         _keepScreenOn.value = enabled
         launch { persistPreferences() }
     }
+    fun updateTaskNotifications(enabled: Boolean) {
+        _taskNotifications.value = enabled
+        launch { persistPreferences() }
+    }
     fun updateKeepAlive(next: KeepAliveSettings) {
         _keepAlive.value = next
         launch { persistPreferences() }
@@ -580,6 +606,7 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
         p["hideTools"] = current.hideToolCalls.toString(); p["collapse"] = current.collapseCompacted.toString()
         p["defaultAutoApprove"] = _defaultAutoApprove.value.toString()
         p["keepScreenOn"] = _keepScreenOn.value.toString()
+        p["taskNotifications"] = _taskNotifications.value.toString()
         val keepAlive = _keepAlive.value
         p["keepAlive.enabled"] = keepAlive.enabled.toString()
         p["keepAlive.wakeLock"] = keepAlive.wakeLock.toString()
@@ -609,5 +636,5 @@ class AppCoordinator(val runtime: ContainerRuntime, val pool: OmpProcessPool, va
         catch (_: java.nio.file.AtomicMoveNotSupportedException) { Files.move(temp.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING) }
         Unit
     }
-    override fun close() { scope.cancel(); features.close(); pool.close(); runtime.close() }
+    override fun close() { composerDrafts.close(); drafts.close(); scope.cancel(); features.close(); pool.close(); runtime.close() }
 }

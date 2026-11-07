@@ -4,8 +4,33 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URI
 import java.security.MessageDigest
+import kotlinx.coroutines.CancellationException
 
 internal data class DistroDownload(val url: String, val sha256: String, val phase: String)
+
+/** A cancelled installer closes its actual network connection, including metadata requests. */
+internal class DistroTransferControl(private val checkOwner: () -> Unit = {}) {
+    private var connection: HttpURLConnection? = null
+    @Volatile private var cancelled = false
+    fun checkActive() {
+        checkOwner()
+        if (cancelled) throw CancellationException("发行版下载已取消")
+    }
+    fun attach(value: HttpURLConnection) {
+        synchronized(this) {
+            checkActive()
+            connection = value
+        }
+    }
+    fun release(value: HttpURLConnection) {
+        synchronized(this) { if (connection === value) connection = null }
+        value.disconnect()
+    }
+    fun cancel() {
+        val active = synchronized(this) { cancelled = true; connection.also { connection = null } }
+        active?.disconnect()
+    }
+}
 
 internal object DistroSources {
     val catalog = listOf(
@@ -27,7 +52,12 @@ internal object DistroSources {
     private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
     private val domesticHosts = setOf("mirrors.tuna.tsinghua.edu.cn", "mirrors.aliyun.com", "mirrors.ustc.edu.cn")
 
-    fun resolve(spec: DistroSpec, mirror: MirrorSource): DistroDownload = resolve(spec, mirror, ::text)
+    fun resolve(spec: DistroSpec, mirror: MirrorSource): DistroDownload = resolve(spec, mirror) { url -> text(url) }
+
+    fun resolve(spec: DistroSpec, mirror: MirrorSource, control: DistroTransferControl): DistroDownload {
+        control.checkActive()
+        return resolve(spec, mirror) { url -> text(url, control) }.also { control.checkActive() }
+    }
 
     internal fun resolve(spec: DistroSpec, mirror: MirrorSource, metadata: (String) -> String): DistroDownload {
         require(spec in catalog) { "不支持的发行版版本或架构：${spec.id} ${spec.version} ${spec.arch}" }
@@ -97,38 +127,50 @@ internal object DistroSources {
         return next
     }
 
-    private fun connect(url: String): HttpURLConnection {
+    private fun connect(url: String, control: DistroTransferControl? = null): HttpURLConnection {
         var current = URI(url)
         // Keep domestic metadata and archives on their selected provider, including every redirect hop.
         val domesticHost = current.host?.takeIf { it in domesticHosts }
         require(current.scheme == "http" || current.scheme == "https") { "只支持 HTTP/HTTPS 下载地址" }
         repeat(8) {
+            control?.checkActive()
             val connection = current.toURL().openConnection() as HttpURLConnection
             connection.connectTimeout = 30_000
             connection.readTimeout = 60_000
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("User-Agent", "WawLink/1.0")
             connection.setRequestProperty("Accept-Encoding", "identity")
-            val code = connection.responseCode
+            val code = try {
+                control?.attach(connection)
+                connection.responseCode.also { control?.checkActive() }
+            } catch (failure: Throwable) {
+                if (control == null) connection.disconnect() else control.release(connection)
+                control?.checkActive()
+                throw failure
+            }
             if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
                 val location = connection.getHeaderField("Location")
-                connection.disconnect()
+                if (control == null) connection.disconnect() else control.release(connection)
                 current = redirectTarget(current, location ?: error("下载重定向缺少目标地址"), domesticHost)
             } else {
-                if (code !in 200..299) { connection.disconnect(); error("下载失败：HTTP $code（${current.host}）") }
+                if (code !in 200..299) {
+                    if (control == null) connection.disconnect() else control.release(connection)
+                    error("下载失败：HTTP $code（${current.host}）")
+                }
                 return connection
             }
         }
         error("下载重定向次数过多")
     }
 
-    private fun text(url: String): String {
-        val connection = connect(url)
+    private fun text(url: String, control: DistroTransferControl? = null): String {
+        val connection = connect(url, control)
         return try {
             val bytes = connection.inputStream.use { input ->
                 val output = java.io.ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
                 while (true) {
+                    control?.checkActive()
                     val count = input.read(buffer)
                     if (count < 0) break
                     require(output.size() + count <= 4 * 1024 * 1024) { "镜像校验元数据过大" }
@@ -137,25 +179,27 @@ internal object DistroSources {
                 output.toByteArray()
             }
             bytes.toString(Charsets.UTF_8)
-        } finally { connection.disconnect() }
+        } finally { if (control == null) connection.disconnect() else control.release(connection) }
     }
 
-    fun transfer(source: String, target: File, expectedSha256: String?, progress: (Long, Long) -> Unit) {
+    fun transfer(source: String, target: File, expectedSha256: String?, control: DistroTransferControl? = null, progress: (Long, Long) -> Unit) {
+        control?.checkActive()
         val expected = expectedSha256?.trim()?.lowercase()
         require(expected == null || sha256Pattern.matches(expected)) { "SHA256 应为 64 位十六进制字符串" }
         var connection: HttpURLConnection? = null
         val local = if (source.startsWith("file:")) File(URI(source)) else File(source)
         val remote = source.startsWith("http://") || source.startsWith("https://")
-        val input = if (remote) { connection = connect(source); connection.inputStream } else {
-            require(local.isFile) { "找不到 rootfs 归档：$source" }; local.inputStream()
-        }
-        val total = if (remote) connection!!.contentLengthLong else local.length()
         val digest = expected?.let { MessageDigest.getInstance("SHA-256") }
         try {
+            val input = if (remote) { connection = connect(source, control); connection.inputStream } else {
+                require(local.isFile) { "找不到 rootfs 归档：$source" }; local.inputStream()
+            }
+            val total = if (remote) connection!!.contentLengthLong else local.length()
             input.use { stream -> target.outputStream().use { output ->
                 val buffer = ByteArray(128 * 1024)
                 var written = 0L
                 while (true) {
+                    control?.checkActive()
                     val count = stream.read(buffer)
                     if (count < 0) break
                     output.write(buffer, 0, count)
@@ -166,10 +210,11 @@ internal object DistroSources {
                 require(total < 0 || written == total) { "归档下载不完整：$written / $total 字节" }
             } }
             if (digest != null) {
+                control?.checkActive()
                 val actual = digest.digest().joinToString("") { "%02x".format(it) }
                 require(actual == expected) { "SHA256 校验失败：预期 $expected，实际 $actual" }
             }
-        } finally { connection?.disconnect() }
+        } finally { connection?.let { if (control == null) it.disconnect() else control.release(it) } }
     }
 
     fun configure(root: File, distro: String, mirror: MirrorSource) {

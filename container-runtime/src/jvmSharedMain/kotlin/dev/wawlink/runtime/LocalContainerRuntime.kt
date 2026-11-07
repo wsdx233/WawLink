@@ -19,6 +19,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -58,6 +59,7 @@ class LocalContainerRuntime internal constructor(
     val paths: RuntimePaths,
     private val measureRootfs: (File, Set<String>) -> Long,
     private val startRootProcess: (String) -> Process = { ProcessBuilder("su", "-c", it).start() },
+    private val resolveDistro: (DistroSpec, MirrorSource, DistroTransferControl) -> DistroDownload = DistroSources::resolve,
     runRootCommand: ((String) -> String)?,
 ) : ContainerRuntime {
     constructor(paths: RuntimePaths) : this(paths, RootfsArchives::size)
@@ -91,6 +93,16 @@ class LocalContainerRuntime internal constructor(
         var discarded = false
     }
     private val rootfsImports = mutableMapOf<String, StagedImport>()
+    private class DistroDeployment(val id: String, val distro: DistroSpec, val name: String, val mirror: MirrorSource, val engine: ContainerEngineType) {
+        var owner: Job? = null
+        var transfer: DistroTransferControl? = null
+        var cancelling = false
+        var finalizing = false
+        var committed = false
+        var failed = false
+    }
+    /** Protected by _deployments along with the corresponding presentation row. */
+    private val distroDeployments = mutableMapOf<String, DistroDeployment>()
     private val idleJobs = mutableMapOf<String, Job>()
     private val packageLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
     private var debugRootfsRemoved = false
@@ -661,26 +673,103 @@ class LocalContainerRuntime internal constructor(
     }
 
     private fun deployment(progress: DeploymentProgress) { synchronized(_deployments) {
+        val installer = distroDeployments[progress.id]
+        val presented = if (installer == null) progress else if (installer.cancelling)
+            progress.copy(progress = null, phase = "正在取消", error = null, cancellable = false, retryable = false)
+        else progress.copy(cancellable = installer.owner != null && !installer.finalizing && !installer.failed,
+            retryable = installer.failed)
         val current = _deployments.value
         val index = current.indexOfFirst { it.id == progress.id }
-        if (index >= 0 && current[index] == progress) return@synchronized
+        if (index >= 0 && current[index] == presented) return@synchronized
         _deployments.value = current.toMutableList().apply {
-            if (index >= 0) this[index] = progress else add(progress)
+            if (index >= 0) this[index] = presented else add(presented)
         }
     } }
     private fun finishDeployment(id: String) { synchronized(_deployments) { _deployments.value = _deployments.value.filterNot { it.id == id } } }
 
     override suspend fun installDistro(distro: DistroSpec, name: String, mirror: MirrorSource, engine: ContainerEngineType): ContainerConfig = withContext(Dispatchers.IO) {
         ensureOpen(); ContainerMetadataStore.validate(ContainerMetadata(title = name))
-        val id = UUID.randomUUID().toString()
-        deployment(DeploymentProgress(id, name, 0f, "读取发行者 SHA256 元数据"))
+        val task = DistroDeployment(UUID.randomUUID().toString(), distro, name, mirror, engine)
+        synchronized(_deployments) { ensureOpen(); distroDeployments[task.id] = task }
+        runDistroDeployment(task, retry = false)
+    }
+
+    override suspend fun retryDistroDeployment(id: String): ContainerConfig = withContext(Dispatchers.IO) {
+        ensureOpen()
+        val task = synchronized(_deployments) { requireNotNull(distroDeployments[id]) { "下载任务已不存在" } }
+        runDistroDeployment(task, retry = true)
+    }
+
+    override suspend fun cancelDeployment(id: String) = withContext(Dispatchers.IO) {
+        val active = synchronized(_deployments) {
+            val task = distroDeployments[id] ?: return@withContext
+            if (task.owner == null || task.failed || task.finalizing || task.cancelling) return@withContext
+            task.cancelling = true
+            deployment(DeploymentProgress(id, task.name, null, "正在取消"))
+            task.owner to task.transfer
+        }
+        active.first?.cancel(CancellationException("发行版部署已取消"))
+        active.second?.cancel()
+    }
+
+    override suspend fun dismissDeployment(id: String) = withContext(Dispatchers.IO) {
+        val owner = requireNotNull(currentCoroutineContext()[Job])
+        val task = synchronized(_deployments) {
+            val task = distroDeployments[id] ?: return@withContext
+            check(task.failed && task.owner == null) { "请先等待下载任务结束" }
+            task.owner = owner; task.failed = false; task.finalizing = true
+            deployment(DeploymentProgress(id, task.name, null, "正在清理下载任务"))
+            task
+        }
         try {
-            val source = DistroSources.resolve(distro, mirror)
-            deploy(id, name, source.url, source.sha256, engine, distro, mirror, source.phase)
+            discardOwnedRootfs(File(rootfsDir, id))
+            Files.deleteIfExists(File(cacheDir, "$id.part").toPath())
+            synchronized(_deployments) { distroDeployments.remove(id); finishDeployment(id) }
         } catch (failure: Throwable) {
+            synchronized(_deployments) {
+                task.owner = null; task.failed = true; task.finalizing = false
+                deployment(DeploymentProgress(id, task.name, null, "清理失败", failure.message ?: failure.toString()))
+            }
+            throw failure
+        } finally {
+            synchronized(_deployments) { if (task.owner === owner) task.owner = null }
+        }
+    }
+
+    private suspend fun runDistroDeployment(task: DistroDeployment, retry: Boolean): ContainerConfig {
+        val context = currentCoroutineContext()
+        val owner = requireNotNull(context[Job])
+        synchronized(_deployments) {
+            ensureOpen()
+            context.ensureActive()
+            check(distroDeployments[task.id] === task && task.owner == null && (!retry || task.failed)) { "下载任务正在运行或已结束" }
+            task.owner = owner; task.failed = false; task.cancelling = false; task.finalizing = false; task.committed = false
+            task.transfer = DistroTransferControl { context.ensureActive() }
+            deployment(DeploymentProgress(task.id, task.name, null, "读取发行者 SHA256 元数据"))
+        }
+        try {
+            val source = resolveDistro(task.distro, task.mirror, requireNotNull(task.transfer))
+            val installed = deploy(task, source)
+            synchronized(_deployments) { distroDeployments.remove(task.id); finishDeployment(task.id) }
+            return installed
+        } catch (failure: Throwable) {
+            val cancelled = failure is CancellationException || !context.isActive
+            synchronized(_deployments) {
+                task.owner = null; task.transfer = null
+                if (task.committed || (cancelled && failure.suppressed.isEmpty())) {
+                    distroDeployments.remove(task.id); finishDeployment(task.id)
+                } else {
+                    task.failed = true; task.cancelling = false; task.finalizing = false
+                    val reason = if (cancelled) failure.suppressed.joinToString("\n") { it.message ?: it.toString() } else failure.message ?: failure.toString()
+                    deployment(DeploymentProgress(task.id, task.name, null, if (cancelled) "取消清理失败" else "部署失败", "发行版部署失败：$reason"))
+                }
+            }
+            if (cancelled) throw if (failure is CancellationException) failure
+                else CancellationException("发行版部署已取消").apply { initCause(failure) }
             val message = "发行版部署失败：${failure.message}"
-            deployment(DeploymentProgress(id, name, 0f, "部署失败", message))
             throw IllegalStateException(message, failure)
+        } finally {
+            synchronized(_deployments) { if (task.owner === owner) { task.owner = null; task.transfer = null } }
         }
     }
 
@@ -893,39 +982,48 @@ class LocalContainerRuntime internal constructor(
         }
     }
 
-    private suspend fun deploy(id: String, name: String, source: String, checksum: String?, engine: ContainerEngineType, distro: DistroSpec?, mirror: MirrorSource?, phase: String): ContainerConfig {
+    private suspend fun deploy(task: DistroDeployment, download: DistroDownload): ContainerConfig {
+        val id = task.id; val name = task.name; val distro = task.distro; val mirror = task.mirror
+        val control = requireNotNull(task.transfer)
         val archive = File(cacheDir, "$id.part")
         val target = File(rootfsDir, id)
         try {
+            control.checkActive()
+            // A failed attempt may have left an owned partial tree after a cleanup error.
+            discardOwnedRootfs(target)
             var lastUpdate = 0L
-            DistroSources.transfer(source, archive, checksum) { bytes, total ->
+            DistroSources.transfer(download.url, archive, download.sha256, control) { bytes, total ->
+                control.checkActive()
                 val now = System.nanoTime()
                 if (now - lastUpdate > 100_000_000 || bytes == total) {
                     val totalLabel = if (total > 0) " / ${total / 1024 / 1024} MB" else ""
-                    deployment(DeploymentProgress(id, name, if (total > 0) (bytes.toFloat() / total).coerceIn(0f, 1f) else null, "$phase · ${bytes / 1024 / 1024} MB$totalLabel"))
+                    deployment(DeploymentProgress(id, name, if (total > 0) (bytes.toFloat() / total).coerceIn(0f, 1f) else null, "${download.phase} · ${bytes / 1024 / 1024} MB$totalLabel"))
                     lastUpdate = now
                 }
             }
             deployment(DeploymentProgress(id, name, null, "安全解压 rootfs"))
-            RootfsArchives.extract(archive, target) { bytes ->
+            RootfsArchives.extract(archive, target, checkActive = control::checkActive) { bytes ->
+                control.checkActive()
                 val now = System.nanoTime()
                 if (now - lastUpdate > 100_000_000) { deployment(DeploymentProgress(id, name, null, "安全解压中 · ${bytes / 1024 / 1024} MB")); lastUpdate = now }
             }
-            val os = readOsRelease(target)
-            val distroId = distro?.id ?: when (os["ID"]) { "archarm", "arch" -> "arch"; else -> os["ID"] ?: "custom" }
-            if (mirror != null) DistroSources.configure(target, distroId, mirror)
-            else {
-                File(target, "workspace").mkdirs()
-                if (!File(target, "etc/resolv.conf").isFile) DistroSources.writeGuest(target, "etc/resolv.conf", "nameserver 223.5.5.5\nnameserver 1.1.1.1\n")
-            }
-            val config = ContainerConfig(id, name, target.canonicalPath, distroId, distro?.version ?: os["VERSION_ID"] ?: "custom", distro?.arch ?: detectArch(target), engine, link2symlink = paths.isAndroid, shell = if (File(target, "bin/bash").exists()) "/bin/bash" else "/bin/sh")
+            readOsRelease(target)
+            val distroId = distro.id
+            DistroSources.configure(target, distroId, mirror)
+            val config = ContainerConfig(id, name, target.canonicalPath, distroId, distro.version, distro.arch, task.engine, link2symlink = paths.isAndroid, shell = if (File(target, "bin/bash").exists()) "/bin/bash" else "/bin/sh")
             engines.validateRoot(config)
-            deployment(DeploymentProgress(id, name, null, "保存容器配置"))
-            register(config, initialTitle = name, onProgress = progressReporter(id, name))
-            finishDeployment(id)
-            return containers.value.first { it.config.id == id }.config
+            synchronized(_deployments) {
+                control.checkActive()
+                task.finalizing = true
+                deployment(DeploymentProgress(id, name, null, "保存容器配置"))
+            }
+            // From this point the container can become durable. A late cancellation must not
+            // delete a registered rootfs or report a completed installation as retryable.
+            return withContext(NonCancellable) {
+                register(config, initialTitle = name, onProgress = progressReporter(id, name)).also { task.committed = true }
+            }
         } catch (failure: Throwable) {
-            try { discardOwnedRootfs(target) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
+            if (!task.committed) try { discardOwnedRootfs(target) } catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
             throw failure
         }
         finally { archive.delete() }
@@ -1004,6 +1102,42 @@ class LocalContainerRuntime internal constructor(
                 if (operation != null) operation.runGeneration = runGenerations[id]
                 idleJobs.remove(id)?.cancel()
                 launchLocked(config(id), arguments, cwd, environment, false, false).process
+            }
+        }
+    }
+
+    override suspend fun closeProcess(id: String, process: Process): Unit = withContext(NonCancellable + Dispatchers.IO) {
+        val target = mutex.withLock {
+            val tracked = processes[id]?.firstOrNull { it.process === process }
+            if (tracked == null) {
+                check(!process.isAlive) { "容器命令不属于指定容器，拒绝清理未知进程" }
+                return@withLock null
+            }
+            check(!tracked.keeper) { "不能通过命令清理接口关闭容器服务" }
+            tracked.stopping = true
+            tracked to (configurations[id]?.engine == ContainerEngineType.CHROOT)
+        } ?: return@withContext
+        val (tracked, root) = target
+        // Serialize repeated closes without holding the runtime mutex during Root I/O or waits.
+        // A concurrent container stop may also signal these same pinned identities safely.
+        tracked.cleanupMutex.withLock {
+            tracked.outputDrainer?.cancel()
+            tracked.refreshDescendants()
+            terminate(listOf(tracked), root, false)
+            if (process.isAlive) process.destroy()
+            waitForTrackedExit(listOf(tracked), 2)
+            tracked.refreshDescendants()
+            terminate(listOf(tracked), root, true)
+            if (process.isAlive) process.destroyForcibly()
+            waitForTrackedExit(listOf(tracked), 2)
+            tracked.terminal?.close()
+            check(!tracked.hasLiveProcesses()) { "容器命令仍有已跟踪子进程未退出，已保留进程身份供重试" }
+            mutex.withLock {
+                // Stop/delete may already have removed this record. Never touch a newer run.
+                processes[id]?.let { records ->
+                    records.remove(tracked)
+                    if (records.isEmpty()) processes.remove(id)
+                }
             }
         }
     }
@@ -1237,6 +1371,10 @@ class LocalContainerRuntime internal constructor(
             if (closed) return@withLock
             closing = true
             scope.cancel()
+            synchronized(_deployments) { distroDeployments.values.toList() }.forEach { task ->
+                task.owner?.cancel(CancellationException("容器运行时已关闭"))
+                task.transfer?.cancel()
+            }
             val failures = mutableListOf<Throwable>()
             rootfsImports.values.toList().forEach { staged ->
                 staged.discarded = true
@@ -1297,6 +1435,7 @@ internal class TrackedProcess(
     },
 ) {
     @Volatile var stopping = false
+    val cleanupMutex = Mutex()
     var outputDrainer: Job? = null
     val pid: Long? = rootIdentity?.first ?: findPid(process)
     private val identities = java.util.concurrent.ConcurrentHashMap<Long, String>()

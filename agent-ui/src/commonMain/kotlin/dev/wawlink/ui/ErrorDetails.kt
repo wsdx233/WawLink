@@ -109,7 +109,7 @@ private val credentialKeyPattern = Regex("(?i)([\\\"']?(?:token|api[_-]?key|pass
 private val urlUserInfoPattern = Regex("(?i)([a-z][a-z0-9+.-]*://)([^/\\s:@]+(?::[^/@\\s]*)?@)")
 
 /** Keep common credential-bearing fragments out of both the summary and copied details. */
-internal fun redactErrorDetails(value: String): String {
+fun redactErrorDetails(value: String): String {
     var result = authorizationCredentialPattern.replace(value) { "${it.groupValues[1]}***" }
     result = urlUserInfoPattern.replace(result) { "${it.groupValues[1]}***@" }
     result = credentialKeyPattern.replace(result) { "${it.groupValues[1]}***" }

@@ -64,8 +64,10 @@ internal object RootfsArchives {
         archive: File,
         destination: File,
         createHardLink: (Path, Path) -> Path = Files::createLink,
+        checkActive: () -> Unit = {},
         progress: (Long) -> Unit = {},
     ) {
+        checkActive()
         val requestedRoot = destination.toPath().toAbsolutePath().normalize()
         Files.createDirectories(requestedRoot)
         require(!Files.isSymbolicLink(requestedRoot)) { "解压目录不能是符号链接" }
@@ -80,6 +82,7 @@ internal object RootfsArchives {
         val buffer = ByteArray(128 * 1024)
         TarArchiveInputStream(unpackStream(archive)).use { tar ->
             while (true) {
+                checkActive()
                 val entry = tar.nextTarEntry ?: break
                 val target = member(root, entry.name)
                 require(tar.canReadEntryData(entry)) { "归档包含不支持的文件格式：${entry.name}" }
@@ -111,6 +114,7 @@ internal object RootfsArchives {
                     entry.isFile && !entry.isFIFO && !entry.isCharacterDevice && !entry.isBlockDevice -> {
                         Files.newOutputStream(target).use { output ->
                             while (true) {
+                                checkActive()
                                 val read = tar.read(buffer)
                                 if (read < 0) break
                                 output.write(buffer, 0, read)
@@ -130,9 +134,11 @@ internal object RootfsArchives {
         }
         var hardlinkFailure: Exception? = null
         while (hardlinks.isNotEmpty()) {
+            checkActive()
             var resolved = false
             val iterator = hardlinks.iterator()
             while (iterator.hasNext()) {
+                checkActive()
                 val (target, linked) = iterator.next()
                 noLinkParents(root, target.parent)
                 noLinkParents(root, linked)
@@ -175,6 +181,7 @@ internal object RootfsArchives {
             root.resolve(wrapper.relativize(path))
         } ?: path
         symlinks.forEach { (original, linkName) ->
+            checkActive()
             val target = relocated(original)
             val linked = if (linkName.startsWith('/')) root.resolve(linkName.trimStart('/'))
             else target.parent.resolve(linkName)
@@ -185,18 +192,22 @@ internal object RootfsArchives {
             Files.createSymbolicLink(target, relative)
         }
         symlinks.forEach { (original, _) ->
+            checkActive()
             require(relocated(original).toFile().canonicalFile.toPath().startsWith(root)) { "符号链接链逃逸 rootfs：$original" }
         }
         directoryModes.asReversed().distinctBy { it.first }.forEach { (path, mode) ->
+            checkActive()
             if (wrapperRoot != null && path == root) return@forEach
             val target = relocated(path)
             setMode(target, mode)
         }
         val entries = owners.entries.filterNot { wrapperRoot != null && it.key == root }.associate { (path, owner) ->
+            checkActive()
             val target = relocated(path)
             val name = root.relativize(target).toString().replace(File.separatorChar, '/')
             (if (name.isEmpty()) "/" else "/$name") to owner
         }
+        checkActive()
         RootfsOwnership.save(destination, OwnershipManifest(entries))
     }
 

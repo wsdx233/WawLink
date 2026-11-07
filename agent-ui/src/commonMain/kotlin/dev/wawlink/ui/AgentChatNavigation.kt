@@ -31,14 +31,19 @@ import androidx.compose.ui.unit.dp
 /** Host navigation requests are separate from a session's saved composer and reading state. */
 class AgentChatNavigation {
     internal data class Location(val id: String, val sequence: Long)
+    internal data class HistoryLocation(val sessionId: String, val entryId: String, val sequence: Long)
     private var sequence = 0L
     internal var location by mutableStateOf<Location?>(null)
+        private set
+    internal var historyLocation by mutableStateOf<HistoryLocation?>(null)
         private set
     internal var backHandler: (() -> Boolean)? = null
 
     fun locate(chatItemId: String) { location = Location(chatItemId, ++sequence) }
+    fun inspectHistory(nativeSessionId: String, entryId: String) { historyLocation = HistoryLocation(nativeSessionId, entryId, ++sequence) }
     fun back(): Boolean = backHandler?.invoke() ?: false
     internal fun located(request: Location) { if (location == request) location = null }
+    internal fun historyLocated(request: HistoryLocation) { if (historyLocation == request) historyLocation = null }
 }
 
 internal expect fun explorerTimestamp(value: String, full: Boolean = false): String

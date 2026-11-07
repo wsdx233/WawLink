@@ -33,7 +33,11 @@ import kotlinx.coroutines.withContext
 import kotlin.coroutines.resume
 import kotlin.math.roundToInt
 
-class HostNavigation { var onBack: (() -> Boolean)? = null }
+class HostNavigation {
+    var onBack: (() -> Boolean)? = null
+    var canLeave: () -> Boolean = { true }
+    val taskSessions = TaskNotificationNavigation()
+}
 
 private data class ContainerAttachmentPick(val container: ContainerConfig, val initialPath: String, val continuation: CancellableContinuation<List<ContainerFileSelection>>)
 private data class ContainerFileOpenRequest(val config: ContainerConfig, val source: String)
@@ -52,7 +56,7 @@ private data class HostRoute(
     val stateKey: String = when (page) {
         "chat", "hub" -> "$page:$sessionId"
         "providers", "management" -> "$page:$containerId:${sessionId ?: "global"}:${initialResource.orEmpty()}"
-        "framework", "container", "files", "rules", "prompts" -> "$page:$containerId"
+        "framework", "container", "files", "rules", "prompts", "content-search" -> "$page:$containerId"
         "plugins", "skills" -> "$page:$containerId:${resourceWorkspace ?: "user"}:$sessionId:$initialResource"
         "extension" -> "extension:$containerId:${feature?.id}"
         "terminal" -> "terminal:$containerId:${installationId ?: "shell"}"
@@ -76,8 +80,13 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
     }
     var page by rememberSaveable { mutableStateOf("home") }
     var selectedSession by rememberSaveable { mutableStateOf<String?>(null) }
+    val notificationRequest = navigation?.taskSessions?.request?.collectAsState()?.value
+    SideEffect { navigation?.taskSessions?.showSession(selectedSession.takeIf { page == "chat" }) }
+    DisposableEffect(navigation) { onDispose { navigation?.taskSessions?.showSession(null) } }
     var selectedContainer by rememberSaveable { mutableStateOf<String?>(null) }
     var installRootfs by rememberSaveable { mutableStateOf(false) }
+    var installReturn by rememberSaveable { mutableStateOf("home") }
+    var readinessReturn by rememberSaveable { mutableStateOf("home") }
     var creatingInContext by remember { mutableStateOf(false) }
     var fileOpenRequest by remember { mutableStateOf<ContainerFileOpenRequest?>(null) }
     var linkedDirectory by remember { mutableStateOf<ContainerFileOpenRequest?>(null) }
@@ -99,9 +108,26 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
     val hubNavigation = remember { HostNavigation() }
     val chatNavigations = remember { mutableMapOf<String, AgentChatNavigation>() }
     val homeNavigation = remember { HostNavigation() }
+    var deferredNotification by remember { mutableStateOf<Long?>(null) }
     var definitionName by rememberSaveable { mutableStateOf<String?>(null) }
     var containerAttachmentPick by remember { mutableStateOf<ContainerAttachmentPick?>(null) }
     val attachmentNavigation = remember { HostNavigation() }
+    LaunchedEffect(notificationRequest, page, fileOpenRequest, linkedDirectory, containerAttachmentPick, homeNavigation.canLeave()) {
+        notificationRequest?.let { request ->
+            val safe = (page == "home" && homeNavigation.canLeave() || page == "chat") &&
+                fileOpenRequest == null && linkedDirectory == null && containerAttachmentPick == null
+            if (!safe) {
+                if (deferredNotification != request.sequence) {
+                    deferredNotification = request.sequence
+                    app.report("请先保存当前页面并返回主页，随后将打开通知会话。")
+                }
+                return@LaunchedEffect
+            }
+            if (app.hasSession(request.sessionId)) { selectedSession = request.sessionId; page = "chat" }
+            else app.report("会话已不存在")
+            navigation?.taskSessions?.handled(request)
+        }
+    }
     fun finishAttachmentPick(selection: List<ContainerFileSelection>) {
         val request = containerAttachmentPick
         containerAttachmentPick = null
@@ -155,6 +181,8 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
         page == "prompts" && promptsNavigation.onBack?.invoke() == true -> true
         page == "hub" && hubNavigation.onBack?.invoke() == true -> true
         page == "hub" -> { page = "chat"; true }
+        page == "install" -> { page = installReturn; true }
+        page == "readiness" -> { page = readinessReturn; true }
         page == "chat" && chatNavigations[selectedSession]?.back() == true -> true
         page == "chat" -> { leaveChat(); true }
         page == "about" || page == "keepalive" -> { page = "appearance"; true }
@@ -163,16 +191,20 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
     }
     SideEffect { navigation?.onBack = ::goBack }
     DisposableEffect(navigation) { onDispose { navigation?.onBack = null } }
-    fun openNew() {
+    fun createNew(containerId: String? = null) {
         if (creatingInContext) return
         if (app.currentContainerId() == null) { installRootfs = false; page = "install"; app.report("请先安装或导入一个容器"); return }
         creatingInContext = true
         app.launch {
             try {
-                val id = app.createInSelectedContainer()
+                val id = if (containerId == null) app.createInSelectedContainer() else app.create("", containerId, "/workspace")
                 withContext(Dispatchers.Main.immediate) { selectedSession = id; page = "chat" }
             } finally { withContext(NonCancellable + Dispatchers.Main.immediate) { creatingInContext = false } }
         }
+    }
+    fun openNew() {
+        if (app.currentContainerId() == null || sessions.none { !app.isEmptyDraft(it) }) { readinessReturn = "home"; page = "readiness" }
+        else createNew()
     }
     fun createInContext(id: String) {
         if (creatingInContext) return
@@ -197,15 +229,16 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
         "chat", "hub" -> HostRoute(page, sessionId = selectedSession, returnPage = if (page == "hub") "chat" else "home")
         "providers", "management" -> HostRoute(page, containerId = configurationContainer?.config?.id,
             sessionId = if (settingsReturn == "chat" || settingsReturn == "hub") selectedSession else resourceSession.takeIf { settingsReturn == "plugins" || settingsReturn == "skills" },
-            returnPage = settingsReturn, resourceWorkspace = resourceWorkspace.takeIf { settingsReturn == "plugins" || settingsReturn == "skills" },
+            returnPage = settingsReturn, resourceWorkspace = resourceWorkspace.takeIf { settingsReturn == "plugins" || settingsReturn == "skills" || settingsReturn == "readiness" },
             initialResource = definitionName.takeIf { settingsReturn == "hub" })
         "framework" -> HostRoute(page, containerId = configurationContainer?.config?.id, returnPage = settingsReturn)
-        "container", "rules", "prompts" -> HostRoute(page, containerId = selectedContainer)
+        "container", "rules", "prompts", "content-search" -> HostRoute(page, containerId = selectedContainer)
         "plugins", "skills" -> HostRoute(page, containerId = selectedContainer, sessionId = resourceSession, returnPage = resourcesReturn, resourceWorkspace = resourceWorkspace, initialResource = initialResource)
         "extension" -> HostRoute(page, containerId = selectedContainer, feature = activeFeature)
         "terminal" -> HostRoute(page, containerId = selectedContainer, installationId = terminalInstallationId, returnPage = terminalReturn)
         "files" -> HostRoute(page, containerId = selectedContainer, returnPage = filesReturn)
-        "install" -> HostRoute(page, rootfs = installRootfs)
+        "install" -> HostRoute(page, rootfs = installRootfs, returnPage = installReturn)
+        "readiness" -> HostRoute(page, returnPage = readinessReturn)
         "about", "keepalive" -> HostRoute(page, returnPage = "appearance")
         else -> HostRoute(page)
     }
@@ -236,8 +269,20 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                             "home" -> HomeScreen(app, files, onSettings = { selectedContainer = app.currentContainerId(); page = "appearance" }, onNewSession = ::openNew,
                                 onEnterSession = { selectedSession = it; page = "chat" },
                                 onContainer = { selectedContainer = it; page = "container" },
-                                onInstall = { installRootfs = it; page = "install" }, onFeature = ::openFeature,
-                                onExtension = { feature -> selectedContainer = app.currentContainerId(); activeFeature = feature; page = "extension" }, navigation = homeNavigation)
+                                onInstall = { installRootfs = it; installReturn = "home"; page = "install" }, onFeature = ::openFeature,
+                                onExtension = { feature -> selectedContainer = app.currentContainerId(); activeFeature = feature; page = "extension" }, navigation = homeNavigation,
+                                onSearchContents = { id -> selectedContainer = id; page = "content-search" })
+                            "content-search" -> current.containerId?.let { containerId ->
+                                ContainerHistorySearchScreen(app, containerId, onBack = { page = "home" }, onOpen = { match ->
+                                    val record = app.sessions.value.firstOrNull { it.record.id == match.appSessionId }?.record
+                                    if (record == null || record.containerId != containerId) app.report("会话已移除或切换容器，请重新搜索")
+                                    else {
+                                        chatNavigations.getOrPut(record.id) { AgentChatNavigation() }.inspectHistory(match.nativeSessionId, match.entryId)
+                                        selectedSession = record.id
+                                        page = "chat"
+                                    }
+                                })
+                            } ?: MissingContainer { page = "home" }
                             "chat" -> {
                                 DisposableEffect(current.sessionId) {
                                     onDispose { if (page == "home" || selectedSession != current.sessionId) current.sessionId?.let(app::leaveSession) }
@@ -246,11 +291,14 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                                 controller.fold(onSuccess = {
                                     val record = sessions.firstOrNull { s -> s.record.id == current.sessionId }?.record
                                     if (record != null) CompositionLocalProvider(
+                                        LocalComposerDraftRepository provides app.drafts,
+                                        LocalComposerDraftRegistry provides app.composerDrafts,
                                         LocalAgentFileLinkHandler provides { source -> openSessionFile(record, source) },
                                         LocalAgentImageSaveHandler provides saveImage,
                                         LocalAgentAttachmentHandler provides remember(app.runtime, record.containerId) { SessionAttachmentReader(app.runtime, record.containerId) },
                                     ) {
-                                        AgentChatScreen(it, app.pool.providers(record.containerId), app.pool.management(record.containerId, record.workspace), ::leaveChat, { createInContext(record.id) },
+                                        val management = remember(record.containerId, record.workspace) { app.pool.management(record.containerId, record.workspace) }
+                                        AgentChatScreen(it, app.pool.providers(record.containerId), management, ::leaveChat, { createInContext(record.id) },
                                         { selectedContainer = record.containerId; settingsReturn = "chat"; page = "providers" },
                                         { selectedContainer = record.containerId; settingsReturn = "chat"; page = "management" },
                                         { selectedContainer = record.containerId; settingsReturn = "chat"; page = "framework" }, files::pickAttachments,
@@ -279,8 +327,9 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                                         LocalAgentImageSaveHandler provides saveImage,
                                         LocalAgentAttachmentHandler provides remember(app.runtime, record.containerId) { SessionAttachmentReader(app.runtime, record.containerId) },
                                     ) {
+                                        val management = remember(record.containerId, record.workspace) { app.pool.management(record.containerId, record.workspace) }
                                         AgentHubScreen(app.pool.explorer(record.id), main, app.pool.providers(record.containerId),
-                                            app.pool.management(record.containerId, record.workspace),
+                                            management,
                                             onBack = { page = "chat" }, onMain = { page = "chat" },
                                             onLocateMain = { id -> chatNavigations.getOrPut(record.id) { AgentChatNavigation() }.locate(id); page = "chat" },
                                             onOpenDefinition = { name -> selectedContainer = record.containerId; definitionName = name; settingsReturn = "hub"; page = "management" },
@@ -312,10 +361,16 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                                 { if (configurationContainer != null) { settingsReturn = "appearance"; page = "providers" } else openNew() },
                                 { if (configurationContainer != null) { settingsReturn = "appearance"; page = "management" } else openNew() },
                                 { if (configurationContainer != null) { settingsReturn = "appearance"; page = "framework" } else openNew() },
-                                { page = "keepalive" }, { page = "about" })
+                                { page = "keepalive" }, { page = "about" }, { readinessReturn = "appearance"; page = "readiness" })
                             "about" -> AboutScreen({ page = "appearance" }, app::showError)
                             "keepalive" -> KeepAliveScreen(app, files, { page = "appearance" })
-                            "install" -> InstallContainerScreen(app, files, current.rootfs, { page = "home" })
+                            "install" -> InstallContainerScreen(app, files, current.rootfs, { page = current.returnPage })
+                            "readiness" -> SessionReadinessScreen(app, onBack = { page = current.returnPage },
+                                onInstallContainer = { installRootfs = false; installReturn = "readiness"; page = "install" },
+                                onConfigureModels = { id -> selectedContainer = id; resourceWorkspace = "/workspace"; settingsReturn = "readiness"; page = "providers" },
+                                onConfigureAgent = { id -> selectedContainer = id; resourceWorkspace = "/workspace"; definitionName = null; settingsReturn = "readiness"; page = "management" },
+                                onRequestOmpInstall = app::requestOmpInstallation,
+                                onStartSession = { id -> createNew(id) })
                             "container" -> containers.firstOrNull { it.config.id == current.containerId }?.let { ContainerDetailScreen(app, files, it, { page = "home" }, ::openTerminal, { id -> selectedContainer = id; filesReturn = "container"; page = "files" }) } ?: MissingContainer { page = "home" }
                             "files" -> containers.firstOrNull { it.config.id == current.containerId }?.let { ContainerFilesScreen(app, files, it.config, { page = current.returnPage }, { fileNavigation.onBack = it }) } ?: MissingContainer { page = "home" }
                             "terminal" -> containers.firstOrNull { it.config.id == current.containerId }?.let { TerminalScreen(app, it.config, { page = terminalReturn }, current.installationId) } ?: MissingContainer { page = terminalReturn }
@@ -433,7 +488,7 @@ internal fun EmptyHost(text: String, icon: String = "forum") {
         trailing()
     }
 }
-@Composable private fun AppearanceScreen(app: AppCoordinator, onBack: () -> Unit, providers: () -> Unit, agent: () -> Unit, framework: () -> Unit, keepAlive: () -> Unit, about: () -> Unit) {
+@Composable private fun AppearanceScreen(app: AppCoordinator, onBack: () -> Unit, providers: () -> Unit, agent: () -> Unit, framework: () -> Unit, keepAlive: () -> Unit, about: () -> Unit, readiness: () -> Unit) {
     val appearance by app.appearance.collectAsState()
     val defaultAutoApprove by app.defaultAutoApprove.collectAsState()
     Column {
@@ -473,11 +528,18 @@ internal fun EmptyHost(text: String, icon: String = "forum") {
             FeatureCardsSettings(app)
             SectionLabel("会话", "forum")
             HostRow("新会话默认免审批", icon = "bolt") { Switch(defaultAutoApprove, app::updateDefaultAutoApprove) }
+            if (app.isAndroid) {
+                val taskNotifications by app.taskNotifications.collectAsState()
+                HostRow("任务通知", icon = "notifications") {
+                    Switch(taskNotifications, app::updateTaskNotifications, modifier = Modifier.semantics { contentDescription = "任务通知" })
+                }
+            }
             SectionLabel("当前容器 Agent", "smart_toy")
             HostRow("模型服务", icon = "deployed_code", onClick = providers) { Symbol("chevron_right") }
             HostRow("Agent 设置", icon = "smart_toy", onClick = agent) { Symbol("chevron_right") }
             HostRow("框架设置", icon = "tune", onClick = framework) { Symbol("chevron_right") }
             SectionLabel("应用", "apps")
+            HostRow("使用准备", icon = "checklist", onClick = readiness) { Symbol("chevron_right") }
             HostRow("后台保活", "电池与后台运行", "shield", onClick = keepAlive) { Symbol("chevron_right") }
             HostRow("关于", "项目与作者", "info", onClick = about) { Symbol("chevron_right") }
         }

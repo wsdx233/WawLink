@@ -13,7 +13,6 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
-import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Modifier
@@ -45,9 +44,11 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.concurrent.Volatile
 import kotlin.math.*
 
 @Composable
@@ -91,34 +92,72 @@ internal fun decimal(value: Double, digits: Int): String {
 internal fun tokens(value: Long): String = when { value >= 1_000_000 -> decimal(value / 1_000_000.0, 1) + "M"; value >= 1_000 -> decimal(value / 1000.0, 1) + "k"; else -> value.toString() }
 
 
-private val AttachmentDraftSaver = listSaver<SnapshotStateList<AttachmentFile>, Any>(
-    save = { files -> files.map { arrayListOf(it.id, it.name, it.path, it.mimeType, it.sizeBytes, it.source.name) } },
-    restore = { rows -> rows.map { row ->
-        val fields = row as List<*>
-        AttachmentFile(fields[0] as String, fields[1] as String, fields[2] as String, fields[3] as String,
-            (fields[4] as Number).toLong(), when (val source = fields[5]) {
-                is Boolean -> if (source) AttachmentSource.WORKSPACE else AttachmentSource.LOCAL
-                else -> AttachmentSource.valueOf(source as String)
-            })
-    }.toMutableStateList() },
-)
-
-internal class ComposerDraftState(val textState: MutableState<String>, val attachments: SnapshotStateList<AttachmentFile>) {
+internal class ComposerDraftState(text: MutableState<String>, files: SnapshotStateList<AttachmentFile>) {
+    var revision = 0L
+        private set
+    val textState = object : MutableState<String> by text {
+        override var value: String
+            get() = text.value
+            set(value) { if (text.value != value) revision++; text.value = value }
+    }
+    val attachments: MutableList<AttachmentFile> = object : AbstractMutableList<AttachmentFile>() {
+        override val size get() = files.size
+        override fun get(index: Int) = files[index]
+        override fun set(index: Int, element: AttachmentFile): AttachmentFile {
+            if (files[index] != element) revision++
+            return files.set(index, element)
+        }
+        override fun add(index: Int, element: AttachmentFile) { files.add(index, element); revision++ }
+        override fun removeAt(index: Int): AttachmentFile = files.removeAt(index).also { revision++ }
+        override fun clear() { if (files.isNotEmpty()) { files.clear(); revision++ } }
+    }
     val hasContent: Boolean get() = textState.value.isNotEmpty() || attachments.isNotEmpty()
     var takingQueuedPrompt by mutableStateOf(false)
+    @Volatile var persistRestoration: ((RestoredSessionPrompt) -> Unit)? = null
+    var restoration by mutableIntStateOf(0)
+        private set
+    fun snapshot() = RestoredSessionPrompt(textState.value, attachments.toList())
     fun restore(prompt: RestoredSessionPrompt, replaceExisting: Boolean) {
         if (takingQueuedPrompt || (!replaceExisting && hasContent)) return
         textState.value = prompt.text
         attachments.clear()
         attachments.addAll(prompt.attachments)
+        restoration++
+        persistRestoration?.invoke(prompt)
     }
 }
 
+val LocalComposerDraftRepository = staticCompositionLocalOf<ComposerDraftRepository?> { null }
+
 @Composable
 internal fun rememberComposerDraft(sessionId: String): ComposerDraftState {
-    val text = rememberSaveable(sessionId) { mutableStateOf("") }
-    val attachments = rememberSaveable(sessionId, saver = AttachmentDraftSaver) { mutableStateListOf<AttachmentFile>() }
-    return remember(sessionId, text, attachments) { ComposerDraftState(text, attachments) }
+    val registry = LocalComposerDraftRegistry.current
+    val saver = remember(sessionId, registry) { composerDraftSaver(sessionId, registry) }
+    val draft = rememberSaveable(sessionId, registry, saver = saver) { composerDraftForSession(sessionId, registry) }
+    val repository = LocalComposerDraftRepository.current
+    SideEffect {
+        val persist = repository?.let { store -> { prompt: RestoredSessionPrompt -> store.update(sessionId, prompt) } }
+        if (registry == null) draft.persistRestoration = persist
+        else registry.bindPersistence(sessionId, draft, persist)
+    }
+    var loaded by remember(sessionId, repository) { mutableStateOf(false) }
+    LaunchedEffect(sessionId, repository) {
+        if (!loaded && repository != null) {
+            val before = draft.revision
+            val saved = repository.load(sessionId)
+            // An asynchronous load must never overwrite typing, picked files, or a restored Android draft.
+            if (!draft.takingQueuedPrompt && !draft.hasContent && before == draft.revision && saved != null) {
+                draft.textState.value = saved.text
+                draft.attachments.addAll(saved.attachments)
+            }
+        }
+        loaded = true
+        if (repository != null) snapshotFlow { draft.snapshot() }.collect { repository.update(sessionId, it) }
+    }
+    DisposableEffect(sessionId, repository) {
+        onDispose { if (loaded || draft.revision > 0) repository?.update(sessionId, draft.snapshot()) }
+    }
+    return draft
 }
 
 @OptIn(ExperimentalAnimationApi::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
@@ -134,9 +173,8 @@ internal fun ComposerArea(controller: AgentSessionController, state: ChatSession
     val keyboard = LocalSoftwareKeyboardController.current
     val inputFocus = remember(draft) { FocusRequester() }
     val currentDraft by rememberUpdatedState(draft)
-    var restoredPromptCount by remember(draft) { mutableIntStateOf(0) }
-    LaunchedEffect(draft, restoredPromptCount) {
-        if (restoredPromptCount > 0) {
+    LaunchedEffect(draft, draft.restoration) {
+        if (draft.restoration > 0) {
             inputFocus.requestFocus()
             keyboard?.show()
         }
@@ -230,7 +268,6 @@ internal fun ComposerArea(controller: AgentSessionController, state: ChatSession
                         draft.takingQueuedPrompt = false
                     }
                 }
-                if (currentDraft === draft) restoredPromptCount++
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 if (currentDraft === draft) pickerError = e.message ?: "无法取回排队消息"

@@ -26,7 +26,7 @@ import dev.wawlink.runtime.*
 import dev.wawlink.ui.*
 
 @Composable
-internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () -> Unit, onNewSession: () -> Unit, onEnterSession: (String) -> Unit, onContainer: (String) -> Unit, onInstall: (Boolean) -> Unit, onFeature: (String) -> Unit, onExtension: (ContainerFeature) -> Unit, navigation: HostNavigation? = null) {
+internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () -> Unit, onNewSession: () -> Unit, onEnterSession: (String) -> Unit, onContainer: (String) -> Unit, onInstall: (Boolean) -> Unit, onFeature: (String) -> Unit, onExtension: (ContainerFeature) -> Unit, navigation: HostNavigation? = null, onSearchContents: (String) -> Unit = {}) {
     var tab by rememberSaveable { mutableStateOf(0) }
     var batch by rememberSaveable { mutableStateOf(false) }
     var selected by rememberSaveable { mutableStateOf(emptySet<String>()) }
@@ -54,6 +54,7 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
     }
     fun exitBatch() { batch = false; selected = emptySet() }
     SideEffect {
+        navigation?.canLeave = { editing == null && switching == null && deleting.isEmpty() }
         navigation?.onBack = {
             when {
                 tab == 1 -> featureNavigation.onBack?.invoke() == true
@@ -62,7 +63,7 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
             }
         }
     }
-    DisposableEffect(navigation) { onDispose { navigation?.onBack = null } }
+    DisposableEffect(navigation) { onDispose { navigation?.onBack = null; navigation?.canLeave = { true } } }
     Scaffold(topBar = {
         if (tab != 1) AgentTopBar(if (batch) "已选 ${selected.size} 项" else listOf("会话", "功能", "容器")[tab], actions = {
             if (batch) {
@@ -106,6 +107,10 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
                 Row(Modifier.padding(top = 8.dp, bottom = 6.dp).fillMaxWidth().height(56.dp).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(28.dp)).padding(start = 18.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Symbol("search")
                     androidx.compose.foundation.text.BasicTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp), decorationBox = { inner -> if (query.isEmpty()) Text("搜索会话或项目", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp); inner() })
+                    AgentIconButton("manage_search", "全文搜索", {
+                        val id = environment ?: currentContainerId
+                        if (id != null) onSearchContents(id) else app.report("请先选择一个容器")
+                    })
                     Box {
                         AgentIconButton("deployed_code", "按容器筛选", { environmentMenu = true }, filled = environment != null)
                         DropdownMenu(environmentMenu, { environmentMenu = false }) {

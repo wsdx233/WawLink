@@ -445,8 +445,15 @@ class OmpEventReducer(initial: ChatSessionUiState, private val clock: () -> Long
                         val queued = if (index >= 0) consumedQueue.removeAt(index) else state.queuedPrompts.firstOrNull {
                             (wireUserText[it.id] ?: it.text) == wireText
                         }
-                        val feedId = queued?.id ?: id
+                        // A pipe failure may be followed by native admission. Keep the original
+                        // identity so recovery cannot offer an already accepted request again.
+                        val uncertain = if (queued == null) state.failedPrompts.firstOrNull {
+                            !it.retryable && it.id !in reconciledUsers &&
+                                (wireUserText[it.id] ?: attachmentWireMessage(it.text, it.attachments)) == wireText
+                        } else null
+                        val feedId = queued?.id ?: uncertain?.id ?: id
                         val parsed = if (queued != null) AttachmentPrompt(queued.text, queued.attachments)
+                            else if (uncertain != null) AttachmentPrompt(uncertain.text, uncertain.attachments)
                             else attachmentPromptsByWire[wireText] ?: parseAttachmentPrompt(wireText)
                         val attachments = parsed.attachments.ifEmpty { nativeImageAttachments(message) }
                         rememberAttachmentPrompt(feedId, parsed.text, attachments, wireText)

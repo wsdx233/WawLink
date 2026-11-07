@@ -57,6 +57,7 @@ fun SessionHistorySheet(
     onFork: suspend (String) -> String,
     onOpenFork: (String) -> Unit,
     focusChatItemId: String? = null,
+    focusEntryId: String? = null,
 ) {
     val history by explorer.history.collectAsState()
     val session by controller.state.collectAsState()
@@ -67,7 +68,7 @@ fun SessionHistorySheet(
     var filter by rememberSaveable(session.id) { mutableStateOf("default") }
     var selectedId by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
     var initialized by rememberSaveable(session.id) { mutableStateOf(false) }
-    var focusApplied by remember(session.id, focusChatItemId) { mutableStateOf(false) }
+    var focusApplied by remember(session.id, focusChatItemId, focusEntryId) { mutableStateOf(false) }
     var historyRead by remember(explorer, session.id) { mutableStateOf(false) }
     val list = key(session.id) { rememberLazyListState() }
     var panel by rememberSaveable(session.id) { mutableStateOf<String?>(null) }
@@ -129,6 +130,7 @@ fun SessionHistorySheet(
         returnPanel = when {
             which == "blocks" && panel == "turns" -> "turns"
             which == "preview" && panel == "rewind" -> "rewind"
+            which == "preview" && panel == "search" -> "search"
             else -> null
         }
         targetId = node?.id
@@ -238,11 +240,14 @@ fun SessionHistorySheet(
             else selectedId?.let { focus(it, true) }
         }
     }
-    LaunchedEffect(explorer, session.id, focusChatItemId) {
-        if (!focusApplied && focusChatItemId != null) {
+    LaunchedEffect(explorer, session.id, focusChatItemId, focusEntryId) {
+        if (!focusApplied && (focusChatItemId != null || focusEntryId != null)) {
             snapshotFlow { historyRead && !history.loading && history.error == null }.first { it }
             try {
-                val node = resolveMessageHistoryNode(explorer, focusChatItemId)
+                val node = if (focusEntryId != null) {
+                    explorer.history.value.nodes.firstOrNull { it.id == focusEntryId }
+                        ?: kotlin.error("原消息已不存在，请重新搜索")
+                } else resolveMessageHistoryNode(explorer, requireNotNull(focusChatItemId))
                 initialized = true
                 focusApplied = true
                 error = null
@@ -255,6 +260,7 @@ fun SessionHistorySheet(
     }
 
     HistorySurface("历史树", onDismiss = { if (!busy) onDismiss() }, full = true, dismissible = !busy, actions = {
+        AgentIconButton("manage_search", "全文查找", { show("search", null) }, enabled = !busy)
         AgentIconButton("content_copy", "复制消息", { show("turns", null) }, enabled = !busy)
         AgentIconButton("history", "回退", { show("rewind", null) }, enabled = !busy)
     }, footer = {
@@ -323,6 +329,15 @@ fun SessionHistorySheet(
     fun dismissPanel() { if (!busy) { panel = returnPanel; returnPanel = null; pendingAnswers = null; error = null; retry = null } }
     panelState.SaveableStateProvider(if (panel in listOf("preview", "label", "switch", "reanswer", "blocks")) "$panel:${targetId.orEmpty()}" else panel ?: "tree") {
     when (panel) {
+        "search" -> HistoryFullTextSearch(explorer, history, { dismissPanel() }, { node ->
+            panel = null
+            focus(node.id, true)
+        }, { node -> show("preview", node) }, { node ->
+            operation {
+                val chatId = explorer.chatItemIdForEntry(node.id) ?: kotlin.error("这个节点在当前聊天中没有可定位的内容")
+                onLocate(chatId); onDismiss()
+            }
+        })
         "preview" -> target?.let { node ->
             HistoryPreview(explorer, node, history.sessionId, controller, expanded, { dismissPanel() }, { detail = it })
         }
@@ -598,10 +613,122 @@ private fun HistorySurface(title: String, onDismiss: () -> Unit, full: Boolean =
 }
 
 @Composable
-private fun HistorySearch(value: String, onChange: (String) -> Unit, onClear: () -> Unit) {
+private fun HistorySearch(value: String, onChange: (String) -> Unit, onClear: () -> Unit, placeholder: String = "搜索内容开头、类型或标签") {
     val c = LocalAgentColors.current
     var focused by remember { mutableStateOf(false) }
-    TextField(value, onChange, Modifier.fillMaxWidth().heightIn(min = 56.dp).onFocusChanged { focused = it.isFocused }.border(2.dp, if (focused) c.primary else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(28.dp)), placeholder = { Text("搜索内容开头、类型或标签", fontSize = 18.sp) }, leadingIcon = { Symbol("search", tint = c.onSurfaceVariant) }, trailingIcon = { if (value.isNotEmpty()) AgentIconButton("close", "清除搜索", onClear) }, singleLine = true, shape = RoundedCornerShape(28.dp), colors = TextFieldDefaults.colors(focusedContainerColor = c.surface, unfocusedContainerColor = c.surfaceContainer, focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent, unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent), textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 18.sp))
+    TextField(value, onChange, Modifier.fillMaxWidth().heightIn(min = 56.dp).onFocusChanged { focused = it.isFocused }.border(2.dp, if (focused) c.primary else androidx.compose.ui.graphics.Color.Transparent, RoundedCornerShape(28.dp)), placeholder = { Text(placeholder, fontSize = 18.sp) }, leadingIcon = { Symbol("search", tint = c.onSurfaceVariant) }, trailingIcon = { if (value.isNotEmpty()) AgentIconButton("close", "清除搜索", onClear) }, singleLine = true, shape = RoundedCornerShape(28.dp), colors = TextFieldDefaults.colors(focusedContainerColor = c.surface, unfocusedContainerColor = c.surfaceContainer, focusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent, unfocusedIndicatorColor = androidx.compose.ui.graphics.Color.Transparent), textStyle = MaterialTheme.typography.bodyLarge.copy(fontSize = 18.sp))
+}
+
+@Composable
+private fun HistoryFullTextSearch(
+    explorer: SessionExplorer,
+    history: SessionHistoryState,
+    onDismiss: () -> Unit,
+    onSelect: (SessionHistoryNode) -> Unit,
+    onPreview: (SessionHistoryNode) -> Unit,
+    onLocate: (SessionHistoryNode) -> Unit,
+) {
+    var query by rememberSaveable(history.sessionId) { mutableStateOf("") }
+    var result by remember(explorer, history.sessionId) { mutableStateOf<SessionHistorySearchPage?>(null) }
+    var loading by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var retry by remember { mutableIntStateOf(0) }
+    var generation by remember { mutableIntStateOf(0) }
+    val scope = rememberCoroutineScope()
+    val list = rememberLazyListState()
+    val byId = remember(history.nodes) { history.nodes.associateBy { it.id } }
+    val c = LocalAgentColors.current
+    LaunchedEffect(explorer, history.sessionId, history.revision, query, retry) {
+        generation++
+        result = null
+        error = null
+        loading = query.isNotBlank()
+        if (query.isBlank()) return@LaunchedEffect
+        try {
+            delay(350)
+            result = explorer.searchHistory(query)
+            list.scrollToItem(0)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            error = failure.message ?: "全文查找失败"
+        } finally { loading = false }
+    }
+    fun more() {
+        val previous = result ?: return
+        val cursor = previous.nextCursor ?: return
+        if (loading) return
+        loading = true
+        error = null
+        val requestGeneration = generation
+        scope.launch {
+            try {
+                val next = explorer.searchHistory(previous.query, cursor)
+                if (generation != requestGeneration || result !== previous) return@launch
+                check(next.sessionId == previous.sessionId && next.sessionFile == previous.sessionFile &&
+                    next.revision == previous.revision && next.query == previous.query && next.total == previous.total) {
+                    "查找分页已变化，请重新查找"
+                }
+                result = next.copy(matches = previous.matches + next.matches)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                if (generation == requestGeneration && result === previous) error = failure.message ?: "读取更多结果失败"
+            } finally { if (generation == requestGeneration) loading = false }
+        }
+    }
+    HistorySurface("全文查找", onDismiss, full = true) {
+        Column(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(horizontal = 20.dp).padding(bottom = 12.dp)) {
+                HistorySearch(query, { query = it }, { query = "" }, "查找正文或附件名")
+            }
+            if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+            error?.let { message ->
+                HistoryBanner(message, error = true, action = "重试", onAction = {
+                    if (result?.nextCursor != null) more()
+                    else scope.launch {
+                        try { explorer.refreshHistory(); retry++ }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (failure: Exception) { error = failure.message ?: "历史读取失败" }
+                    }
+                })
+            }
+            when {
+                query.isBlank() -> HistoryEmpty("manage_search", "查找当前会话的完整内容")
+                result?.matches?.isEmpty() == true && !loading -> HistoryEmpty("search_off", "没有匹配的内容")
+                else -> LazyColumn(state = list, modifier = Modifier.weight(1f).fillMaxWidth(), contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 24.dp)) {
+                    val page = result
+                    if (page != null) item("count") { Text("${page.total} 条消息", Modifier.padding(vertical = 12.dp), color = c.primary, fontSize = 18.sp) }
+                    items(page?.matches.orEmpty(), key = { it.entryId }) { match ->
+                        val node = byId[match.entryId]
+                        if (node != null && node.version == match.version) {
+                            val annotated = remember(match, c.warnContainer) { buildAnnotatedString {
+                                append(match.text)
+                                addStyle(SpanStyle(background = c.warnContainer), match.matchStart, match.matchEnd)
+                            } }
+                            Row(Modifier.fillMaxWidth().padding(vertical = 3.dp).clip(RoundedCornerShape(20.dp)).background(c.surfaceContainerLow)
+                                .clickable { onSelect(node) }.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Symbol(historyType(node).first, tint = c.primary)
+                                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(historyTitle(node), fontSize = 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text(annotated, fontSize = 17.sp, lineHeight = 25.sp, maxLines = 5, overflow = TextOverflow.Ellipsis)
+                                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                                        AgentIconButton("visibility", "查看完整节点", { onPreview(node) })
+                                        AgentIconButton("chat", "在聊天中定位", { onLocate(node) }, enabled = node.onCurrentPath)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (page?.nextCursor != null) item("more") {
+                        TextButton({ more() }, Modifier.fillMaxWidth().heightIn(min = 48.dp), enabled = !loading) {
+                            Symbol("expand_more"); Spacer(Modifier.width(8.dp)); Text("加载更多", fontSize = 18.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 @Composable
 private fun historyTonalColors() = ButtonDefaults.filledTonalButtonColors(containerColor = LocalAgentColors.current.primaryContainer, contentColor = LocalAgentColors.current.onPrimaryContainer)

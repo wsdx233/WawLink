@@ -119,6 +119,30 @@ internal class OmpSessionExplorer(
         detail
     }
 
+    override suspend fun searchHistory(query: String, cursor: String?): SessionHistorySearchPage {
+        val value = query.trim()
+        require(value.isNotEmpty() && value.length <= 256) { "请输入不超过 256 字的查找内容" }
+        val before = history.value
+        check(before.sessionId.isNotBlank()) { "请先读取会话历史" }
+        val response = call("explorer_history_search", buildJsonObject {
+            put("sessionId", before.sessionId); put("query", value)
+            if (cursor != null) put("cursor", cursor) else put("revision", before.revision)
+        })
+        val current = history.value
+        check(response.string("sessionId") == before.sessionId && response.optional("sessionFile") == before.sessionFile &&
+            current.sessionId == before.sessionId && current.sessionFile == before.sessionFile && response.string("query") == value) {
+            "查找所属会话已变化，请重新查找"
+        }
+        return SessionHistorySearchPage(before.sessionId, before.sessionFile, response.string("revision"), value,
+            response.objects("matches").map { match ->
+                val text = match.string("text")
+                val start = match["matchStart"]?.jsonPrimitive?.intOrNull ?: -1
+                val end = match["matchEnd"]?.jsonPrimitive?.intOrNull ?: -1
+                check(start >= 0 && end > start && end <= text.length) { "全文查找返回了无效的命中位置" }
+                SessionHistorySearchMatch(match.string("entryId"), match.string("version"), text, start, end)
+            }, response["total"]?.jsonPrimitive?.intOrNull ?: 0, response.optional("nextCursor"))
+    }
+
     override suspend fun entryIdForChatItem(chatItemId: String): String? {
         val message = messageForChatItem(chatItemId) ?: return null
         val response = call("explorer_history_find", buildJsonObject { put("message", message) })

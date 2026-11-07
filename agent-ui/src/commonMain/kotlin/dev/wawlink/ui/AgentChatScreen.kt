@@ -69,10 +69,31 @@ fun AgentChatScreen(
         var detail by remember(state.id) { mutableStateOf<FeedDetail?>(null) }
         var historyOpen by rememberSaveable(state.id) { mutableStateOf(false) }
         var historyFocus by rememberSaveable(state.id) { mutableStateOf<String?>(null) }
+        var historyEntryFocus by rememberSaveable(state.id) { mutableStateOf<String?>(null) }
+        var historyNavigationError by remember(state.id) { mutableStateOf<String?>(null) }
+        val historyLocation = navigation.historyLocation
+        LaunchedEffect(historyLocation, explorer) {
+            val request = historyLocation ?: return@LaunchedEffect
+            try {
+                explorer.refreshHistory()
+                val history = explorer.history.value
+                history.error?.let { error(it) }
+                check(history.sessionId == request.sessionId) { "会话历史已改变，请重新搜索" }
+                check(history.nodes.any { it.id == request.entryId }) { "原消息已不存在，请重新搜索" }
+                historyFocus = null
+                historyEntryFocus = request.entryId
+                historyOpen = true
+            } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
+            catch (failure: Exception) { historyNavigationError = failure.message ?: "无法定位历史消息" }
+            finally { navigation.historyLocated(request) }
+        }
         val messageActions = remember(explorer, state.id) { MessageHistoryActionsState(explorer) { controller.state.value.isRunning } }
         val messageScope = key(explorer, state.id) { rememberCoroutineScope() }
         val historyStates = rememberSaveableStateHolder()
         val draft = rememberComposerDraft(state.id)
+        historyNavigationError?.let { error ->
+            ErrorDetailsDialog("无法定位历史消息", error) { historyNavigationError = null }
+        }
         SideEffect {
             navigation.backHandler = {
                 when {
@@ -252,7 +273,7 @@ fun AgentChatScreen(
             LocalFeedInteraction provides { followTail = false }, LocalFeedItemNavigation provides { id -> anchorFeedItem(id) },
             LocalFeedHistoryRunning provides state.isRunning,
             LocalFeedHistoryRequest provides { id, action ->
-                if (action == FeedHistoryAction.LOCATE) { historyFocus = id; historyOpen = true }
+                if (action == FeedHistoryAction.LOCATE) { historyEntryFocus = null; historyFocus = id; historyOpen = true }
                 else messageScope.launch { messageActions.open(id, action) }
             }) {
         val scrolled by remember(list) { derivedStateOf { list.firstVisibleItemIndex > 0 || list.firstVisibleItemScrollOffset > 4 } }
@@ -266,7 +287,7 @@ fun AgentChatScreen(
                         AgentIconButton("forum", "会话列表", onNavigateToSessionList)
                         Text(state.title, Modifier.weight(1f).padding(start = 4.dp), style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         AgentIconButton("edit_square", "新建会话", onNewSession)
-                        AgentIconButton("account_tree", "历史树", { historyFocus = null; historyOpen = true })
+                        AgentIconButton("account_tree", "历史树", { historyFocus = null; historyEntryFocus = null; historyOpen = true })
                         AgentIconButton("groups", "Agent 运行总览", onOpenAgentHub)
                         Box {
                             AgentIconButton("settings", "设置", { settingsMenu = true })
@@ -332,6 +353,11 @@ fun AgentChatScreen(
                                 ChatErrorBanner(state.error ?: lastError.orEmpty(), state.modelId, controller::dismissError,
                                     onOpenProviderSettings, onOpenAgentSettings, onRequestOmpRepair)
                             }
+                            AnimatedVisibility(state.failedPrompts.isNotEmpty(),
+                                enter = expandVertically(tween(320, easing = EmphDecelEasing)) + fadeIn(tween(220)),
+                                exit = shrinkVertically(tween(240, easing = EmphAccelEasing)) + fadeOut(tween(150))) {
+                                FailedPromptRecovery(controller, state.failedPrompts, draft)
+                            }
                             ComposerArea(controller, state, providers, modelRepository, onOpenProviderSettings, onPickFiles, onPickContainerFiles, { followTail = true }, draft = draft)
                         }
                     }
@@ -353,7 +379,7 @@ fun AgentChatScreen(
                 onLocate = { id -> historyOpen = false; navigation.locate(id) },
                 onRestorePrompt = { prompt, replace -> draft.restore(prompt, replace) }, hasDraft = draft.hasContent,
                 onFork = onFork, onOpenFork = { id -> historyOpen = false; onOpenFork(id) },
-                focusChatItemId = historyFocus)
+                focusChatItemId = historyFocus, focusEntryId = historyEntryFocus)
         }
         MessageHistoryActionSheet(messageActions, draft.hasContent, state.isRunning) { prompt, replace -> draft.restore(prompt, replace) }
     }

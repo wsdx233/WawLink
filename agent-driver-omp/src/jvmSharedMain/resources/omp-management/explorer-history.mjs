@@ -2,7 +2,10 @@ import { AskTool, recoverAskQuestions } from '@oh-my-pi/pi-coding-agent/tools/as
 import { mkdtemp } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { parseAttachmentPrompt } from './attachment-prompts.mjs';
+export { parseAttachmentPrompt } from './attachment-prompts.mjs';
+import { compileHistoryQuery, findHistoryMatch } from './history-search.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { sameMessageContent, sessionMessagePersistenceKey } from '@oh-my-pi/pi-coding-agent/session/turn-persistence';
 import { isUserRequestEntry, transcriptEntryMessage, userTurnDraft } from '@oh-my-pi/pi-tui/chat/transcript-entry';
@@ -11,53 +14,8 @@ const PAGE_SIZE = 256;
 const MAX_SNAPSHOTS = 4;
 const MAX_REVISIONS = 64;
 const MAX_RETAINED_CHANGES = 8192;
+const SEARCH_PAGE_SIZE = 64;
 const indexes = new WeakMap();
-
-const ATTACHMENT_MARKER = '\n\n附件（容器内真实文件）：\n';
-function attachmentMimeType(name) {
-  const dot = name.lastIndexOf('.'), extension = dot < 0 ? '' : name.slice(dot + 1).toLowerCase();
-  if (['png', 'webp', 'gif'].includes(extension)) return `image/${extension}`;
-  if (['jpg', 'jpeg'].includes(extension)) return 'image/jpeg';
-  if (extension === 'svg') return 'image/svg+xml';
-  if (['json', 'map'].includes(extension)) return 'application/json';
-  if (['txt', 'log', 'conf', 'ini', 'toml', 'kt', 'kts', 'java', 'py', 'sh', 'rs', 'go', 'c', 'h', 'cpp', 'hpp'].includes(extension)) return 'text/plain';
-  if (['md', 'markdown'].includes(extension)) return 'text/markdown';
-  if (['yaml', 'yml'].includes(extension)) return 'application/yaml';
-  if (['html', 'htm'].includes(extension)) return 'text/html';
-  if (extension === 'css') return 'text/css';
-  if (['js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx'].includes(extension)) return 'text/javascript';
-  if (extension === 'xml') return 'application/xml';
-  if (extension === 'csv') return 'text/csv';
-  return 'application/octet-stream';
-}
-
-// Keep this grammar identical to AttachmentPrompts.kt. Native messages remain
-// untouched for persistence identity; only presentation fields lose transport text.
-export function parseAttachmentPrompt(message, attachments = []) {
-  const unchanged = () => ({ text: message, attachments });
-  const marker = message.lastIndexOf(ATTACHMENT_MARKER);
-  if (marker < 0) return unchanged();
-  const text = message.slice(0, marker);
-  const references = [];
-  for (const line of message.slice(marker + ATTACHMENT_MARKER.length).split('\n')) {
-    if (!line.startsWith('- ') || /[\u0000-\u001f\u007f]/u.test(line)) return unchanged();
-    const separator = line.indexOf(': /', 2);
-    if (separator < 0) return unchanged();
-    const name = line.slice(2, separator), path = line.slice(separator + 2);
-    if (!name.length || name.includes('/') || path === '/' ||
-      path.endsWith('/') || path.split('/').some(segment => segment === '.' || segment === '..')) return unchanged();
-    references.push({ name, path });
-  }
-  const remaining = [...attachments];
-  const restored = references.map(({ name, path }) => {
-    const index = remaining.findIndex(file => file.name === name && file.path === path);
-    return index >= 0 ? remaining.splice(index, 1)[0] : {
-      id: `legacy:${createHash('sha256').update(`${name}\n${path}`, 'utf8').digest('hex')}`,
-      name, path, mimeType: attachmentMimeType(name), sizeBytes: 0, source: 'CONTAINER',
-    };
-  });
-  return { text, attachments: [...restored, ...remaining] };
-}
 
 export function presentedUserPrompt(entry) {
   if (!isUserRequestEntry(entry)) return null;
@@ -116,7 +74,7 @@ function refresh(manager) {
   let state = indexes.get(manager);
   if (!state || state.sessionId !== sessionId) {
     state = { sessionId, generation: randomUUID(), sequence: 0, nodeSequence: 0, pass: 0,
-      records: new Map(), order: [], revisions: [], retainedChanges: 0, snapshots: new Map() };
+      records: new Map(), order: [], revisions: [], retainedChanges: 0, snapshots: new Map(), searches: new Map() };
     indexes.set(manager, state);
   }
   const entries = manager.getEntries(); // A shallow array copy is intentional.
@@ -236,6 +194,41 @@ function page(snapshot, offset) {
     revision: snapshot.revision, reset: snapshot.reset, nodes: snapshot.nodes.slice(offset, offset + PAGE_SIZE),
     removedIds: snapshot.removedIds.slice(Math.max(0, offset - snapshot.nodes.length), Math.max(0, offset + PAGE_SIZE - snapshot.nodes.length)),
     nextCursor: offset + PAGE_SIZE < snapshot.nodes.length + snapshot.removedIds.length ? `${snapshot.id}:${offset + PAGE_SIZE}` : null };
+}
+
+// Only an explicit search visits complete message bodies. Search snapshots retain
+// excerpts and native identities, never copies of the entire transcript.
+export function historySearch(manager, request = {}) {
+  const query = typeof request.query === 'string' ? request.query.trim() : '';
+  if (!query || query.length > 256) throw Error('请输入不超过 256 字的查找内容');
+  if (request.sessionId !== manager.getSessionId()) throw Error('查找所属会话已变化，请重新查找');
+  let state = indexes.get(manager), snapshot, offset = 0;
+  if (request.cursor != null) {
+    if (typeof request.cursor !== 'string') throw Error('全文查找游标无效，请重新查找');
+    const [id, offsetText, extra] = request.cursor.split(':');
+    snapshot = state?.sessionId === manager.getSessionId() && state.searches.get(id);
+    offset = Number(offsetText);
+    if (!snapshot || snapshot.query !== query || snapshot.sessionFile !== (manager.getSessionFile() ?? null) || extra !== undefined ||
+      !Number.isSafeInteger(offset) || offset <= 0 || offset % SEARCH_PAGE_SIZE || offset >= snapshot.matches.length)
+      throw Error('全文查找已过期，请重新查找');
+  } else {
+    state = refresh(manager);
+    if (request.revision !== state.revision) throw Error('会话历史已更新，请重新查找');
+    const pattern = compileHistoryQuery(query);
+    const matches = [];
+    for (const id of state.order) {
+      const record = state.records.get(id);
+      const match = findHistoryMatch(record.entry, pattern, presentedUserPrompt);
+      if (match) matches.push({ entryId: id, version: record.node.version, ...match });
+    }
+    snapshot = { id: randomUUID(), sessionId: state.sessionId, sessionFile: state.sessionFile,
+      revision: state.revision, query, matches };
+    state.searches.set(snapshot.id, snapshot);
+    while (state.searches.size > MAX_SNAPSHOTS) state.searches.delete(state.searches.keys().next().value);
+  }
+  return { sessionId: snapshot.sessionId, sessionFile: snapshot.sessionFile, revision: snapshot.revision,
+    query, matches: snapshot.matches.slice(offset, offset + SEARCH_PAGE_SIZE), total: snapshot.matches.length,
+    nextCursor: offset + SEARCH_PAGE_SIZE < snapshot.matches.length ? `${snapshot.id}:${offset + SEARCH_PAGE_SIZE}` : null };
 }
 
 export function historyDetail(manager, request) {

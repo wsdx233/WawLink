@@ -1,6 +1,6 @@
 import { AgentRegistry, MAIN_AGENT_ID } from '@oh-my-pi/pi-coding-agent/registry/agent-registry';
 import { createRuntimeExplorer } from './explorer-runtime.mjs';
-import { forkHistory, historyBranch, historyDetail, historyFind, historyPosition, historySnapshot, reanswer, requireIdle, restoredNavigation } from './explorer-history.mjs';
+import { forkHistory, historyBranch, historyDetail, historyFind, historyPosition, historySearch, historySnapshot, reanswer, requireIdle, restoredNavigation } from './explorer-history.mjs';
 import { safeReason } from './diagnostics.mjs';
 
 export function explorerError(error, request) {
@@ -32,6 +32,7 @@ export function createSessionExplorer(pi, getContext) {
         case 'explorer_history': data = historySnapshot(context.sessionManager, request); break;
         case 'explorer_history_detail': data = historyDetail(context.sessionManager, request); break;
         case 'explorer_history_find': data = historyFind(context.sessionManager, request); break;
+        case 'explorer_history_search': data = historySearch(context.sessionManager, request); break;
         case 'explorer_history_branch': data = historyBranch(context.sessionManager); break;
         case 'explorer_label': {
           if (typeof request.entryId !== 'string' || (request.label != null && typeof request.label !== 'string')) throw Error('Invalid native label');

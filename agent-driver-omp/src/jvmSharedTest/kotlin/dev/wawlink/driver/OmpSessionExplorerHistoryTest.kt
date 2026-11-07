@@ -117,6 +117,43 @@ class OmpSessionExplorerHistoryTest {
         } finally { owner.cancel() }
     }
 
+    @Test fun fullTextSearchChecksNativeScopeAndHighlightBoundsWithoutLoadingDetails() = runBlocking {
+        val owner = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        var mode = "valid"
+        try {
+            val explorer = explorer(owner) { op, body ->
+                when (op) {
+                    "explorer_history" -> page("r1", "a", listOf(node("a")))
+                    "explorer_history_search" -> {
+                        assertEquals("native-main", body["sessionId"]!!.jsonPrimitive.content)
+                        assertEquals("查找", body["query"]!!.jsonPrimitive.content)
+                        assertEquals("r1", body["revision"]!!.jsonPrimitive.content)
+                        buildJsonObject {
+                            put("sessionId", if (mode == "foreign") "another-session" else "native-main")
+                            put("sessionFile", "/session/main.jsonl"); put("revision", "r1"); put("query", "查找"); put("total", 1)
+                            put("matches", buildJsonArray { add(buildJsonObject {
+                                put("entryId", "a"); put("version", "v1"); put("text", "完整查找内容")
+                                put("matchStart", 2); put("matchEnd", if (mode == "bounds") 999 else 4)
+                            }) })
+                        }
+                    }
+                    else -> error("Full text search must not request transcript details: $op")
+                }
+            }
+            assertFailsWith<IllegalStateException> { explorer.searchHistory("查找") }
+            explorer.refreshHistory()
+            val result = explorer.searchHistory(" 查找 ")
+            assertEquals(SessionHistorySearchMatch("a", "v1", "完整查找内容", 2, 4), result.matches.single())
+            assertEquals("a", explorer.history.value.leafId)
+            mode = "foreign"
+            assertFailsWith<IllegalStateException> { explorer.searchHistory("查找") }
+            mode = "bounds"
+            assertFailsWith<IllegalStateException> { explorer.searchHistory("查找") }
+            assertFailsWith<IllegalArgumentException> { explorer.searchHistory(" ") }
+            assertFailsWith<IllegalArgumentException> { explorer.searchHistory("长".repeat(257)) }
+        } finally { owner.cancel() }
+    }
+
     @Test fun hubRosterRemainsAvailableWithoutHistoryOrTranscriptDetails() = runBlocking {
         val owner = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         try {

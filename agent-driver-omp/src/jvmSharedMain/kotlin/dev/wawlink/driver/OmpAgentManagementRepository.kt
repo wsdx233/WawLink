@@ -49,6 +49,7 @@ internal class OmpAgentManagementRepository(
     }
     private val nativeChild = AtomicReference<NativeChild?>()
     private val parkGeneration = AtomicLong()
+    private val needsReload = AtomicBoolean(!loadInitially)
     private val versions = mutableMapOf<String, String>()
 
     private fun currentStopGeneration(): Long = runtime.containers.value.firstOrNull { it.config.id == context.containerId }?.stopGeneration
@@ -73,6 +74,18 @@ internal class OmpAgentManagementRepository(
         if (loadInitially && generation != null) {
             scope.launch { reloadForGeneration(false, generation) }
         } else if (loadInitially) mutable.update { it.copy(loading = false, modelsLoading = false) }
+    }
+
+    /** A later explicit consumer can resume a cancelled/lazy load; cancellation never retries itself. */
+    internal fun ensureLoaded() {
+        if (closed || !needsReload.compareAndSet(true, false)) return
+        val generation = runtime.containers.value.firstOrNull { it.config.id == context.containerId }?.stopGeneration
+        if (generation == null) {
+            mutable.update { it.copy(loading = false, modelsLoading = false) }
+            return
+        }
+        mutable.update { it.copy(loading = true, modelsLoading = true, error = null, modelsError = null) }
+        scope.launch { reloadForGeneration(false, generation) }
     }
 
     val resources: AgentResourceRepository = object : AgentResourceRepository {
@@ -374,8 +387,15 @@ internal class OmpAgentManagementRepository(
     private suspend fun reloadForSession(online: Boolean, session: OmpFileSession) = withContext(Dispatchers.IO) {
         val stopGeneration = session.stopGeneration
         operations.withLock { ompConfigMutex.withLock {
+            needsReload.set(false)
             try { reloadLocked(online, session) }
-            catch (cancelled: CancellationException) { throw cancelled }
+            catch (cancelled: CancellationException) {
+                val stopped = closed || runtime.wasInterrupted(context.containerId, stopGeneration)
+                needsReload.set(!stopped)
+                mutable.update { it.copy(loading = false, modelsLoading = false,
+                    modelsError = if (stopped) it.modelsError else "原生配置读取已取消，请重新加载：${cancelled.message ?: cancelled.javaClass.simpleName}") }
+                throw cancelled
+            }
             catch (failure: Exception) {
                 mutable.update { it.copy(loading = false, modelsLoading = false,
                     error = if (failure is OmpProcessStoppedException || runtime.wasInterrupted(context.containerId, stopGeneration)) it.error else managementFailure(failure)) }

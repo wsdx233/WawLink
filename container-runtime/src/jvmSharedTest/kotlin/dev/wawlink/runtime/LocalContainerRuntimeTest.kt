@@ -201,6 +201,138 @@ class LocalContainerRuntimeTest {
         } finally { refuseSnapshot = false; runtime.close(); awaitSizeWork(runtime) }
     } }
 
+    @Test fun closeProcessReclaimsOnlyItsTreeWithoutHoldingTheRuntimeMutex(): Unit = fixture { _, data, config -> runBlocking {
+        saved(data, config, 111L)
+        val runtime = LocalContainerRuntime(RuntimePaths(data, hostProot = "/missing-engine-must-not-be-launched"))
+        val command = ProcessBuilder("/bin/sh", "-c", "sleep 60 & echo \$!; wait").start()
+        val child = command.inputStream.bufferedReader().readLine().toLong()
+        val sibling = ProcessBuilder("sleep", "60").start()
+        val keeperProcess = ProcessBuilder("sleep", "60").start()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val pauseSnapshot = AtomicBoolean(false)
+        val target = TrackedProcess(command, keeper = false, statReader = { pid ->
+            if (pauseSnapshot.compareAndSet(true, false)) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS)) { "Snapshot was not released" }
+            }
+            runCatching { File("/proc/$pid/stat").readText() }.getOrNull()
+        })
+        val siblingRecord = TrackedProcess(sibling, keeper = false)
+        val keeper = TrackedProcess(keeperProcess, keeper = true)
+        @Suppress("UNCHECKED_CAST")
+        val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
+            .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
+        @Suppress("UNCHECKED_CAST")
+        val keepers = LocalContainerRuntime::class.java.getDeclaredField("keepers").apply { isAccessible = true }
+            .get(runtime) as MutableMap<String, TrackedProcess>
+        records[config.id] = mutableListOf(target, siblingRecord, keeper)
+        keepers[config.id] = keeper
+        try {
+            pauseSnapshot.set(true)
+            val closing = async(Dispatchers.IO) { runtime.closeProcess(config.id, command) }
+            assertTrue(withContext(Dispatchers.IO) { entered.await(5, TimeUnit.SECONDS) })
+            // The target's slow /proc read must not block unrelated metadata/container work.
+            withTimeout(1_000) { runtime.readMetadata(config.id) }
+            release.countDown()
+            closing.await()
+            assertFalse(target.hasLiveProcesses())
+            val childStat = runCatching { File("/proc/$child/stat").readText() }.getOrNull()
+            assertTrue(childStat == null || childStat.substringAfterLast(") ").startsWith("Z "))
+            assertTrue(sibling.isAlive)
+            assertTrue(keeperProcess.isAlive)
+            assertFalse(siblingRecord.stopping)
+            assertFalse(keeper.stopping)
+            assertEquals<List<TrackedProcess>>(listOf(siblingRecord, keeper), records.getValue(config.id).toList())
+            assertEquals(0L, runtime.containers.value.single().stopGeneration)
+            runtime.closeProcess(config.id, command) // Repeated close is harmless after removal.
+        } finally {
+            release.countDown()
+            try { runtime.close(); awaitSizeWork(runtime) }
+            finally {
+                listOf(command, sibling, keeperProcess).forEach { if (it.isAlive) it.destroyForcibly() }
+                HostCommands.run(listOf("/bin/sh", "-c", "kill -KILL $child 2>/dev/null || true"))
+            }
+        }
+    } }
+
+    @Test fun closeProcessPreservesPrivilegedIdentityBeforeDestroyingItsLauncherAndCanRetry(): Unit = fixture { _, data, config -> runBlocking {
+        saved(data, config.copy(engine = ContainerEngineType.CHROOT), 111L)
+        val signals = java.util.Collections.synchronizedList(mutableListOf<String>())
+        // Only Root authorization is simulated. Signals, launcher and worker lifetimes are real.
+        val runtime = LocalContainerRuntime(RuntimePaths(data), RootfsArchives::size, runRootCommand = { command ->
+            if (command.contains("kill -TERM") || command.contains("kill -KILL")) signals += command
+            HostCommands.run(listOf("/bin/sh", "-c", "id() { printf '0\\n'; };\n$command"))
+        })
+        val launcher = ProcessBuilder("sleep", "60").start()
+        val worker = ProcessBuilder("/bin/sh", "-c", "sleep 60 & echo \$!; wait").start()
+        val child = worker.inputStream.bufferedReader().readLine().toLong()
+        val sibling = ProcessBuilder("sleep", "60").start()
+        fun stat(pid: Long): String? = runCatching { File("/proc/$pid/stat").readText() }.getOrNull()
+        val identity = requireNotNull(stat(worker.pid())).substringAfterLast(") ").split(' ')[19]
+        var refuseSnapshot = false
+        val target = TrackedProcess(launcher, keeper = false, rootIdentity = worker.pid() to identity, privilegedSnapshot = {
+            check(!refuseSnapshot) { "Root snapshot refused" }
+            listOfNotNull(stat(worker.pid()), stat(child))
+        })
+        val siblingRecord = TrackedProcess(sibling, keeper = false)
+        @Suppress("UNCHECKED_CAST")
+        val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
+            .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
+        records[config.id] = mutableListOf(target, siblingRecord)
+        try {
+            refuseSnapshot = true
+            assertEquals("Root snapshot refused", assertFailsWith<IllegalStateException> {
+                runtime.closeProcess(config.id, launcher)
+            }.message)
+            assertTrue(launcher.isAlive, "A failed identity read must preserve the original launcher")
+            assertTrue(worker.isAlive)
+            assertSame(target, records.getValue(config.id).first())
+            assertTrue(signals.isEmpty())
+            refuseSnapshot = false
+            runtime.closeProcess(config.id, launcher)
+            assertFalse(launcher.isAlive)
+            assertFalse(target.hasLiveProcesses())
+            assertTrue(sibling.isAlive)
+            assertEquals<List<TrackedProcess>>(listOf(siblingRecord), records.getValue(config.id).toList())
+            assertTrue(signals.any { it.contains("/proc/${worker.pid()}/stat") })
+            assertTrue(signals.none { it.contains("/proc/${sibling.pid()}/stat") })
+            assertEquals(0L, runtime.containers.value.single().stopGeneration)
+        } finally {
+            refuseSnapshot = false
+            try { runtime.close(); awaitSizeWork(runtime) }
+            finally {
+                listOf(launcher, worker, sibling).forEach { if (it.isAlive) it.destroyForcibly() }
+                HostCommands.run(listOf("/bin/sh", "-c", "kill -KILL $child 2>/dev/null || true"))
+            }
+        }
+    } }
+
+    @Test fun closeProcessRejectsKeepersAndCommandsOwnedByAnotherContainer(): Unit = fixture { _, data, config -> runBlocking {
+        saved(data, config, 111L)
+        val runtime = LocalContainerRuntime(RuntimePaths(data, hostProot = "/missing-engine-must-not-be-launched"))
+        val command = ProcessBuilder("sleep", "60").start()
+        val keeperProcess = ProcessBuilder("sleep", "60").start()
+        val target = TrackedProcess(command, keeper = false)
+        val keeper = TrackedProcess(keeperProcess, keeper = true)
+        @Suppress("UNCHECKED_CAST")
+        val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
+            .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
+        records[config.id] = mutableListOf(target, keeper)
+        try {
+            assertFailsWith<IllegalStateException> { runtime.closeProcess("another-container", command) }
+            assertFailsWith<IllegalStateException> { runtime.closeProcess(config.id, keeperProcess) }
+            assertTrue(command.isAlive)
+            assertTrue(keeperProcess.isAlive)
+            assertFalse(target.stopping)
+            assertFalse(keeper.stopping)
+            assertEquals(0L, runtime.containers.value.single().stopGeneration)
+        } finally {
+            try { runtime.close(); awaitSizeWork(runtime) }
+            finally { listOf(command, keeperProcess).forEach { if (it.isAlive) it.destroyForcibly() } }
+        }
+    } }
+
     private fun restrictedStartup(engine: ContainerEngineType, pending: Boolean = false) = fixture { directory, data, config -> runBlocking {
         val root = File(config.rootfsPath)
         val home = File(root, "srv/private-home")

@@ -8,6 +8,9 @@ interface SessionExplorer {
     val hub: StateFlow<AgentHubState>
     suspend fun refreshHistory()
     suspend fun loadHistoryDetail(entryId: String, kind: HistoryDetailKind): SessionHistoryDetail
+    /** Searches full native content only on demand. Cursors retain one immutable result snapshot. */
+    suspend fun searchHistory(query: String, cursor: String? = null): SessionHistorySearchPage =
+        throw UnsupportedOperationException("当前会话不支持全文查找")
     /** Resolve only the explicitly selected message; the index never carries full chat records. */
     suspend fun entryIdForChatItem(chatItemId: String): String?
     suspend fun chatItemIdForEntry(entryId: String): String?
@@ -65,6 +68,24 @@ data class SessionHistoryNode(
 )
 
 enum class HistoryDetailKind { PREVIEW, RAW, COPY, ASK }
+
+data class SessionHistorySearchMatch(
+    val entryId: String,
+    val version: String,
+    val text: String,
+    val matchStart: Int,
+    val matchEnd: Int,
+)
+
+data class SessionHistorySearchPage(
+    val sessionId: String,
+    val sessionFile: String?,
+    val revision: String,
+    val query: String,
+    val matches: List<SessionHistorySearchMatch>,
+    val total: Int,
+    val nextCursor: String? = null,
+)
 
 data class SessionHistoryDetail(
     val sessionId: String,
