@@ -127,7 +127,7 @@ class LocalContainerRuntimeTest {
         exited.waitFor()
         var refuseSnapshot = false
         var refusedReads = 0
-        val tracked = TrackedProcess(exited, keeper = false, rootIdentity = 1L to "1",
+        val tracked = TrackedProcess(exited, keeper = false, ownerScope = this, rootIdentity = 1L to "1",
             privilegedSnapshot = {
                 if (refuseSnapshot) { refusedReads++; error("residual identity access refused") }
                 emptyList()
@@ -162,11 +162,11 @@ class LocalContainerRuntimeTest {
         exited.waitFor()
         var refuseSnapshot = false
         var deniedReads = 0
-        val keeper = TrackedProcess(exited, keeper = true, rootIdentity = 1L to "1", privilegedSnapshot = {
+        val keeper = TrackedProcess(exited, keeper = true, ownerScope = this, rootIdentity = 1L to "1", privilegedSnapshot = {
             if (refuseSnapshot) { deniedReads++; error("idle snapshot refused") }
             emptyList()
         })
-        val oldKeeper = TrackedProcess(exited, keeper = true, rootIdentity = 2L to "2", privilegedSnapshot = { emptyList() })
+        val oldKeeper = TrackedProcess(exited, keeper = true, ownerScope = this, rootIdentity = 2L to "2", privilegedSnapshot = { emptyList() })
         @Suppress("UNCHECKED_CAST")
         fun <T> records(name: String): MutableMap<String, T> =
             LocalContainerRuntime::class.java.getDeclaredField(name).apply { isAccessible = true }.get(runtime) as MutableMap<String, T>
@@ -211,15 +211,15 @@ class LocalContainerRuntimeTest {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val pauseSnapshot = AtomicBoolean(false)
-        val target = TrackedProcess(command, keeper = false, statReader = { pid ->
+        val target = TrackedProcess(command, keeper = false, ownerScope = this, statReader = { pid ->
             if (pauseSnapshot.compareAndSet(true, false)) {
                 entered.countDown()
                 check(release.await(5, TimeUnit.SECONDS)) { "Snapshot was not released" }
             }
             runCatching { File("/proc/$pid/stat").readText() }.getOrNull()
         })
-        val siblingRecord = TrackedProcess(sibling, keeper = false)
-        val keeper = TrackedProcess(keeperProcess, keeper = true)
+        val siblingRecord = TrackedProcess(sibling, keeper = false, ownerScope = this)
+        val keeper = TrackedProcess(keeperProcess, keeper = true, ownerScope = this)
         @Suppress("UNCHECKED_CAST")
         val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
             .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
@@ -271,11 +271,11 @@ class LocalContainerRuntimeTest {
         fun stat(pid: Long): String? = runCatching { File("/proc/$pid/stat").readText() }.getOrNull()
         val identity = requireNotNull(stat(worker.pid())).substringAfterLast(") ").split(' ')[19]
         var refuseSnapshot = false
-        val target = TrackedProcess(launcher, keeper = false, rootIdentity = worker.pid() to identity, privilegedSnapshot = {
+        val target = TrackedProcess(launcher, keeper = false, ownerScope = this, rootIdentity = worker.pid() to identity, privilegedSnapshot = {
             check(!refuseSnapshot) { "Root snapshot refused" }
             listOfNotNull(stat(worker.pid()), stat(child))
         })
-        val siblingRecord = TrackedProcess(sibling, keeper = false)
+        val siblingRecord = TrackedProcess(sibling, keeper = false, ownerScope = this)
         @Suppress("UNCHECKED_CAST")
         val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
             .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>
@@ -313,8 +313,8 @@ class LocalContainerRuntimeTest {
         val runtime = LocalContainerRuntime(RuntimePaths(data, hostProot = "/missing-engine-must-not-be-launched"))
         val command = ProcessBuilder("sleep", "60").start()
         val keeperProcess = ProcessBuilder("sleep", "60").start()
-        val target = TrackedProcess(command, keeper = false)
-        val keeper = TrackedProcess(keeperProcess, keeper = true)
+        val target = TrackedProcess(command, keeper = false, ownerScope = this)
+        val keeper = TrackedProcess(keeperProcess, keeper = true, ownerScope = this)
         @Suppress("UNCHECKED_CAST")
         val records = LocalContainerRuntime::class.java.getDeclaredField("processes").apply { isAccessible = true }
             .get(runtime) as MutableMap<String, MutableList<TrackedProcess>>

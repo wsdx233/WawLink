@@ -269,7 +269,7 @@ internal class RuntimeEngines(
         onProgress("检查容器引擎与运行身份", null)
         var root = validate(config)
         RootfsOwnership.requireStable(config)
-        val ownership = RootfsOwnership.load(File(config.rootfsPath))
+        val ownership = RootfsOwnership.status(File(config.rootfsPath))
         val expected = RootfsOwnership.mapped(config.engine)
         if (!config.ownershipMigrationDeferred && ((config.engine == ContainerEngineType.CHROOT && ownership == null) ||
             (ownership != null && ownership.physical != expected))) {

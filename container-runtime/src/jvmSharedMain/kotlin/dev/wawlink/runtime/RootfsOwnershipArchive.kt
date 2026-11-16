@@ -66,7 +66,7 @@ internal suspend fun exportOwnedRootfs(
                 } }
             }
             try {
-                val manifest = RootfsOwnership.load(root)
+                val manifest = RootfsOwnership.status(root)
                 val logicalOwners = if (manifest?.physical == ContainerEngineType.PROOT) {
                     RootfsOwnership.refresh(config, rootCommand, entries).entries
                 } else emptyMap()

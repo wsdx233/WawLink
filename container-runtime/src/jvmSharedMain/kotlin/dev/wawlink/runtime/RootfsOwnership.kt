@@ -1,5 +1,6 @@
 package dev.wawlink.runtime
 
+import dev.wawlink.runtime.RootfsOwnershipJson.validPath
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.file.FileVisitResult
@@ -11,8 +12,7 @@ import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption.ATOMIC_MOVE
 import java.nio.file.StandardCopyOption.REPLACE_EXISTING
 import java.nio.file.attribute.BasicFileAttributes
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+import java.nio.file.attribute.FileTime
 
 private const val OWNERSHIP_SCAN_COMPLETE = "WAWLINK_SNAPSHOT_COMPLETE"
 private const val OWNERSHIP_LINKS = "WAWLINK_SNAPSHOT_LINKS"
@@ -66,21 +66,17 @@ private val OWNERSHIP_SCAN_WORKER = """
 
 /** The sidecar is App-private and outside the guest tree; tar headers carry portable ownership. */
 internal object RootfsOwnership {
-    private val json = Json { ignoreUnknownKeys = true }
     private val storeLock = Any()
     private const val MAX_ID = 4294967294L
     private const val MODE_MASK = 4095 // 07777, including suid, sgid and sticky
+    private data class Stamp(val key: Any?, val size: Long, val modified: FileTime, val changed: FileTime)
+    private data class CachedStatus(val stamp: Stamp, val status: RootfsOwnershipJson.Status)
+    private val statuses = object : LinkedHashMap<Path, CachedStatus>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Path, CachedStatus>): Boolean = size > 16
+    }
     private val virtual = listOf("/dev", "/proc", "/sys", "/host-rootfs", "/sdcard", "/storage")
 
     fun sidecar(root: File): File = File(root.absoluteFile.normalize().path + ".wawlink-ownership.json")
-    private fun validPath(path: String): Boolean = path.startsWith('/') && !path.startsWith("//") && '\u0000' !in path && '\n' !in path && '\r' !in path &&
-        (path == "/" || (!path.endsWith('/') && path.split('/').drop(1).none { it.isEmpty() || it == "." || it == ".." }))
-    private fun validate(manifest: OwnershipManifest) {
-        require(manifest.version == 1) { "不支持的逻辑属主清单版本：${manifest.version}" }
-        manifest.entries.forEach { (path, owner) ->
-            require(validPath(path) && owner.uid in 0..MAX_ID && owner.gid in 0..MAX_ID && owner.mode in 0..MODE_MASK) { "逻辑属主清单包含无效路径、身份或权限位：$path" }
-        }
-    }
     private fun checkedSidecar(root: File): Path {
         val file = sidecar(root).toPath()
         require(!Files.isSymbolicLink(file)) { "逻辑属主清单不能是符号链接：$file" }
@@ -89,35 +85,85 @@ internal object RootfsOwnership {
         }
         return file
     }
-    fun load(root: File): OwnershipManifest? = synchronized(storeLock) {
-        val file = checkedSidecar(root)
-        if (!Files.exists(file, NOFOLLOW_LINKS)) return@synchronized null
-        json.decodeFromString<OwnershipManifest>(Files.readAllBytes(file).toString(Charsets.UTF_8)).also(::validate)
+    private fun stamp(file: Path): Stamp {
+        val attributes = Files.readAttributes(file, BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+        require(attributes.isRegularFile && (Files.getAttribute(file, "unix:nlink", NOFOLLOW_LINKS) as Number).toLong() == 1L) {
+            "逻辑属主清单必须是单硬链接普通文件：$file"
+        }
+        return Stamp(attributes.fileKey(), attributes.size(), attributes.lastModifiedTime(), Files.getAttribute(file, "unix:ctime", NOFOLLOW_LINKS) as FileTime)
     }
-    fun save(root: File, manifest: OwnershipManifest) = synchronized(storeLock) {
-        validate(manifest)
+    private fun read(root: File, retainEntries: Boolean = false, guestPath: String? = null): RootfsOwnershipJson.Document? {
+        val file = checkedSidecar(root)
+        if (!Files.exists(file, NOFOLLOW_LINKS)) { statuses.remove(file); return null }
+        val before = stamp(file)
+        val document = Files.newInputStream(file, NOFOLLOW_LINKS).use { RootfsOwnershipJson.read(it, retainEntries, guestPath) }
+        check(stamp(file) == before) { "逻辑属主清单读取期间已变化" }
+        statuses[file] = CachedStatus(before, document.status)
+        return document
+    }
+    fun status(root: File): RootfsOwnershipJson.Status? = synchronized(storeLock) {
+        val file = checkedSidecar(root)
+        if (!Files.exists(file, NOFOLLOW_LINKS)) { statuses.remove(file); return@synchronized null }
+        val before = stamp(file)
+        statuses[file]?.takeIf { it.stamp == before }?.let { return@synchronized it.status }
+        read(root)?.status
+    }
+    fun load(root: File): OwnershipManifest? = synchronized(storeLock) {
+        val document = read(root, retainEntries = true) ?: return@synchronized null
+        val status = document.status
+        OwnershipManifest(requireNotNull(document.entries), status.version, status.physical, status.origin, document.migration)
+    }
+    private fun write(root: File, body: (FileOutputStream) -> Unit): Path {
         val file = checkedSidecar(root)
         val temporary = Files.createTempFile(file.parent, ".ownership-", ".tmp")
         try {
             Files.setAttribute(temporary, "unix:mode", 384, NOFOLLOW_LINKS) // 0600
-            FileOutputStream(temporary.toFile()).use { output ->
-                output.write(json.encodeToString(manifest).toByteArray(Charsets.UTF_8)); output.fd.sync()
-            }
+            FileOutputStream(temporary.toFile()).use { output -> body(output); output.fd.sync() }
             checkedSidecar(root)
-            Files.move(temporary, file, ATOMIC_MOVE, REPLACE_EXISTING)
-        } finally { Files.deleteIfExists(temporary) }
+            return Files.move(temporary, file, ATOMIC_MOVE, REPLACE_EXISTING)
+        } finally { statuses.remove(file); Files.deleteIfExists(temporary) }
     }
-    fun copyManifest(source: File, destination: File) { load(source)?.let { save(destination, it) } }
+    fun save(root: File, manifest: OwnershipManifest) = synchronized(storeLock) {
+        write(root) { RootfsOwnershipJson.write(it, manifest) }
+    }
+    private fun updateOwner(root: File, path: String, owner: LogicalOwner) {
+        val file = checkedSidecar(root)
+        if (!Files.exists(file, NOFOLLOW_LINKS)) return
+        val before = stamp(file)
+        write(root) { output ->
+            Files.newInputStream(file, NOFOLLOW_LINKS).use { RootfsOwnershipJson.read(it, guestPath = path, output = output, replacement = owner) }
+            check(stamp(file) == before) { "逻辑属主清单提交期间已变化" }
+        }
+    }
+    fun copyManifest(source: File, destination: File) = synchronized(storeLock) {
+        val file = checkedSidecar(source)
+        if (!Files.exists(file, NOFOLLOW_LINKS)) return@synchronized
+        val before = stamp(file)
+        status(source)
+        write(destination) { output ->
+            Files.newInputStream(file, NOFOLLOW_LINKS).use { it.copyTo(output) }
+            check(stamp(file) == before) { "逻辑属主清单复制期间已变化" }
+        }
+        Unit
+    }
     fun moveManifest(source: File, destination: File) = synchronized(storeLock) {
         val original = checkedSidecar(source)
-        if (Files.exists(original, NOFOLLOW_LINKS)) Files.move(original, checkedSidecar(destination), ATOMIC_MOVE, REPLACE_EXISTING)
+        val target = checkedSidecar(destination)
+        statuses.remove(original)
+        statuses.remove(target)
+        if (Files.exists(original, NOFOLLOW_LINKS)) Files.move(original, target, ATOMIC_MOVE, REPLACE_EXISTING)
     }
-    fun deleteManifest(root: File) = synchronized(storeLock) { Files.deleteIfExists(checkedSidecar(root)); Unit }
+    fun deleteManifest(root: File) = synchronized(storeLock) {
+        val file = checkedSidecar(root)
+        statuses.remove(file)
+        Files.deleteIfExists(file)
+        Unit
+    }
 
     fun managedHome(config: ContainerConfig, rootCommand: ((String) -> String)? = null): String = containerHome(config, rootCommand)
     fun managedOwner(config: ContainerConfig, guestPath: String, mode: Int, directory: Boolean, rootCommand: ((String) -> String)? = null): LogicalOwner {
         require(validPath(guestPath)) { "容器逻辑路径无效：$guestPath" }
-        load(File(config.rootfsPath))?.entries?.get(guestPath)?.let { return it.copy(mode = mode and MODE_MASK) }
+        synchronized(storeLock) { read(File(config.rootfsPath), guestPath = guestPath)?.owner }?.let { return it.copy(mode = mode and MODE_MASK) }
         val text = if (rootCommand != null) passwd(config, rootCommand) else {
             val passwd = File(config.rootfsPath, "etc/passwd")
             containerHostPath(config, passwd)
@@ -127,13 +173,13 @@ internal object RootfsOwnership {
     }
     fun recordHostWrite(config: ContainerConfig, file: File) = synchronized(storeLock) {
         val root = File(config.rootfsPath)
-        val manifest = load(root) ?: return@synchronized
+        if (status(root) == null) return@synchronized
         val (base, target) = containerHostPath(config, file)
         val path = "/" + base.relativize(target).toString()
         require(Files.exists(target, NOFOLLOW_LINKS) && !Files.isSymbolicLink(target)) { "宿主提交的文件不存在或为链接：$target" }
         val mode = (Files.getAttribute(target, "unix:mode", NOFOLLOW_LINKS) as Number).toInt() and MODE_MASK
         val committed = managedOwner(config, path, mode, Files.isDirectory(target, NOFOLLOW_LINKS))
-        save(root, manifest.copy(entries = manifest.entries + (path to committed)))
+        updateOwner(root, path, committed)
     }
 
     /** The privileged pinned-parent commit already verified the inode; never probe it as App. */
@@ -142,8 +188,7 @@ internal object RootfsOwnership {
         val path = "/" + root.relativize(target).toString()
         require(validPath(path)) { "容器逻辑路径无效：$path" }
         val storageRoot = File(config.rootfsPath)
-        val manifest = load(storageRoot) ?: return@synchronized
-        save(storageRoot, manifest.copy(entries = manifest.entries + (path to owner)))
+        updateOwner(storageRoot, path, owner)
     }
 
     internal data class Entry(val path: String, val uid: Long, val gid: Long, val mode: Int, val device: Long, val inode: Long, val links: Long, val kind: Int, val linkTarget: String? = null, val size: Long = 0L) {
@@ -352,11 +397,11 @@ internal object RootfsOwnership {
     /** A physical-only legacy marker deliberately carries no reconstructed logical history. */
     fun retainPhysicalIdentity(config: ContainerConfig) {
         val root = File(config.rootfsPath)
-        if (load(root) == null) save(root, OwnershipManifest(emptyMap(), physical = mapped(config.engine), origin = "physical-only-v1"))
+        if (status(root) == null) save(root, OwnershipManifest(emptyMap(), physical = mapped(config.engine), origin = "physical-only-v1"))
     }
-    fun physical(config: ContainerConfig): ContainerEngineType = load(File(config.rootfsPath))?.physical ?: mapped(config.engine)
+    fun physical(config: ContainerConfig): ContainerEngineType = status(File(config.rootfsPath))?.physical ?: mapped(config.engine)
     fun requireStable(config: ContainerConfig) {
-        check(load(File(config.rootfsPath))?.pending == null) { "容器属主迁移尚未完成；请重新保存目标引擎设置以继续迁移，不能启动或归档半迁移的 Rootfs" }
+        check(status(File(config.rootfsPath))?.pending != true) { "容器属主迁移尚未完成；请重新保存目标引擎设置以继续迁移，不能启动或归档半迁移的 Rootfs" }
     }
     fun refresh(config: ContainerConfig, rootCommand: ((String) -> String)? = null, scanned: List<Entry>? = null): OwnershipManifest {
         requireStable(config)

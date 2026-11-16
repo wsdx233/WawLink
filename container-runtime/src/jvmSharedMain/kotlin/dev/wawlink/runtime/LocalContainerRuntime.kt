@@ -26,6 +26,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -147,7 +148,7 @@ class LocalContainerRuntime internal constructor(
                 resolver.collect { content ->
                     if (content != null) mutex.withLock {
                         for (config in configurations.values) {
-                            if (keepers[config.id]?.process?.isAlive != true) continue
+                            if (keepers[config.id]?.isAlive != true) continue
                             try { updateDns(config, content) } catch (failure: Exception) {
                                 if (failure is CancellationException) throw failure
                                 // The affected container exposes the error; keep observing network changes.
@@ -201,7 +202,7 @@ class LocalContainerRuntime internal constructor(
     }
     private fun publish() {
         _containers.value = configurations.values.map {
-            ContainerInfo(it, keepers[it.id]?.let { keeper -> !keeper.stopping && keeper.process.isAlive } == true,
+            ContainerInfo(it, keepers[it.id]?.let { keeper -> !keeper.stopping && keeper.isAlive } == true,
                 sizes[it.id] ?: 0, errors[it.id] ?: dnsErrors[it.id], runGenerations[it.id] ?: 0,
                 metadataErrors[it.id], stopGenerations[it.id] ?: 0)
         }
@@ -293,8 +294,8 @@ class LocalContainerRuntime internal constructor(
                 report("保存容器配置", null)
                 configurations[config.id] = config.copy(rootfsPath = root.path, isDefault = config.isDefault || configurations.isEmpty())
                 if (config.engine == ContainerEngineType.CHROOT && !config.ownershipMigrationDeferred) {
-                    val manifest = RootfsOwnership.load(root)
-                    if (manifest == null || manifest.physical != ContainerEngineType.CHROOT || manifest.pending != null) {
+                    val manifest = RootfsOwnership.status(root)
+                    if (manifest == null || manifest.physical != ContainerEngineType.CHROOT || manifest.pending) {
                         val context = currentCoroutineContext()
                         RootfsOwnership.migrate(config, config, engines::rootCommand, report) {
                             context.ensureActive()
@@ -338,7 +339,7 @@ class LocalContainerRuntime internal constructor(
         ensureAvailable(id)
         val config = config(id)
         RootfsOwnership.requireStable(config)
-        if (keepers[id]?.let { !it.stopping && it.process.isAlive } == true) return
+        if (keepers[id]?.let { !it.stopping && it.isAlive } == true) return
         paths.resolvConf?.value?.let { updateDns(config, it) }
         val report = progressReporter(id, config.displayName)
         var prepared = false
@@ -454,9 +455,9 @@ class LocalContainerRuntime internal constructor(
             require(File(previous.rootfsPath).canonicalPath == File(config.rootfsPath).canonicalPath) { "请通过导入/克隆更换 rootfs，不能直接修改路径" }
             if (!migrateOwnership) RootfsOwnership.requireStable(previous)
             engines.validate(config)
-            val manifest = RootfsOwnership.load(File(config.rootfsPath))
+            val manifest = RootfsOwnership.status(File(config.rootfsPath))
             val needed = migrateOwnership && (RootfsOwnership.mapped(previous.engine) != RootfsOwnership.mapped(config.engine) ||
-                manifest?.pending != null || (manifest != null && manifest.physical != RootfsOwnership.mapped(config.engine)))
+                manifest?.pending == true || (manifest != null && manifest.physical != RootfsOwnership.mapped(config.engine)))
             if (needed) RootfsOwnership.preflight(engines::rootCommand)
             needed
         }
@@ -490,7 +491,7 @@ class LocalContainerRuntime internal constructor(
             ensureOpen(); ensureAvailable(config.id)
             val previous = config(config.id)
             RootfsOwnership.requireStable(previous)
-            val running = keepers[config.id]?.process?.isAlive == true
+            val running = keepers[config.id]?.isAlive == true
             if (running || engines.hasOwnedMounts(config.id)) stopLocked(config.id)
             revokeHostRootAccess(previous, target)
             if (!migrateOwnership) RootfsOwnership.retainPhysicalIdentity(previous)
@@ -539,8 +540,8 @@ class LocalContainerRuntime internal constructor(
         val root = File(existing.rootfsPath).canonicalFile
         // Registered developer/user-owned external trees are never recursively deleted.
         if (root.toPath().startsWith(rootfsDir.canonicalFile.toPath()) && root != rootfsDir.canonicalFile) {
-            val ownership = RootfsOwnership.load(root)
-            if (ownership?.physical == ContainerEngineType.CHROOT || ownership?.pending != null || (ownership == null && existing.engine == ContainerEngineType.CHROOT)) {
+            val ownership = RootfsOwnership.status(root)
+            if (ownership?.physical == ContainerEngineType.CHROOT || ownership?.pending == true || (ownership == null && existing.engine == ContainerEngineType.CHROOT)) {
                 RootfsOwnership.deleteRootfs(existing, engines::rootCommand)
             } else RootfsArchives.deleteTree(root)
         }
@@ -625,7 +626,7 @@ class LocalContainerRuntime internal constructor(
                 ensureAvailable(reservedId)
                 require(reservedId !in configurations) { "容器 ID 已存在：$reservedId" }
             }
-            val generation = runGenerations[id]?.takeIf { keepers[id]?.let { !it.stopping && it.process.isAlive } == true }
+            val generation = runGenerations[id]?.takeIf { keepers[id]?.let { !it.stopping && it.isAlive } == true }
             stopLocked(id)
             RootfsOperation(original, generation, stopGenerations.getValue(id), reservedId).also {
                 rootfsOperations[id] = it
@@ -785,8 +786,8 @@ class LocalContainerRuntime internal constructor(
     }
 
     private fun discardOwnedRootfs(root: File) {
-        val manifest = RootfsOwnership.load(root)
-        if (manifest?.physical == ContainerEngineType.CHROOT || manifest?.pending != null) {
+        val manifest = RootfsOwnership.status(root)
+        if (manifest?.physical == ContainerEngineType.CHROOT || manifest?.pending == true) {
             RootfsOwnership.deleteRootfs(ContainerConfig("discard", "discard", root.absolutePath, engine = ContainerEngineType.CHROOT), engines::rootCommand)
         } else RootfsArchives.deleteTree(root)
     }
@@ -928,12 +929,12 @@ class LocalContainerRuntime internal constructor(
                     }
                 }
             } else {
-                val stored = RootfsOwnership.load(staged.root)
-                if (stored?.pending != null) {
+                val stored = RootfsOwnership.status(staged.root)
+                if (stored?.pending == true) {
                     val context = currentCoroutineContext()
                     RootfsOwnership.migrate(candidate, candidate, engines::rootCommand, report) { context.ensureActive() }
                 }
-                val physical = RootfsOwnership.load(staged.root)?.physical
+                val physical = RootfsOwnership.status(staged.root)?.physical
                 val stagingConfig = candidate.copy(engine = physical ?: ContainerEngineType.PROOT)
                 val snapshot = try { metadataStore.read(stagingConfig) } catch (failure: Exception) {
                     if (mode == RootfsImportMode.RENAME) throw failure
@@ -1080,7 +1081,7 @@ class LocalContainerRuntime internal constructor(
                 ensureOpen()
                 ensureAvailable(id)
                 if (operation?.runGeneration == null) startLocked(id)
-                else if (keepers[id]?.let { !it.stopping && it.process.isAlive } != true) throw CancellationException("容器已停止")
+                else if (keepers[id]?.let { !it.stopping && it.isAlive } != true) throw CancellationException("容器已停止")
                 if (operation != null) operation.runGeneration = runGenerations[id]
                 idleJobs.remove(id)?.cancel()
                 launchLocked(config(id), arguments, cwd, environment, false, false).process
@@ -1098,7 +1099,7 @@ class LocalContainerRuntime internal constructor(
                 if (operation != null && !operation.isCurrent(this@LocalContainerRuntime)) throw CancellationException("容器已停止或重新启动")
                 ensureOpen()
                 ensureAvailable(id)
-                check(keepers[id]?.let { !it.stopping && it.process.isAlive } == true) { "容器已停止" }
+                check(keepers[id]?.let { !it.stopping && it.isAlive } == true) { "容器已停止" }
                 if (operation != null) operation.runGeneration = runGenerations[id]
                 idleJobs.remove(id)?.cancel()
                 launchLocked(config(id), arguments, cwd, environment, false, false).process
@@ -1165,7 +1166,7 @@ class LocalContainerRuntime internal constructor(
             error("无法安全识别 su 启动的 chroot PID；执行确认未发送，Root Shell 将超时退出")
         }
         val tracked = try {
-            TrackedProcess(process, keeper, identity, if (root) engines::rootSnapshot else null, terminal,
+            TrackedProcess(process, keeper, scope, identity, if (root) engines::rootSnapshot else null, terminal,
                 ownsProcessGroup = !root && pty && paths.isAndroid)
         }
         catch (failure: Throwable) { process.destroyForcibly(); terminal?.close(); pidFile?.delete(); throw failure }
@@ -1182,7 +1183,7 @@ class LocalContainerRuntime internal constructor(
             } catch (failure: Throwable) {
                 // A SupervisorJob does not consume launch failures: never rethrow pipe closure.
                 mutex.withLock {
-                    if (!closed && !tracked.stopping && process.isAlive && keepers[config.id] === tracked) {
+                    if (!closed && !tracked.stopping && tracked.isAlive && keepers[config.id] === tracked) {
                         val reason = "容器引擎输出读取失败：${failure.message ?: failure.javaClass.simpleName}"
                         try { stopLocked(config.id, intentional = false) }
                         catch (cleanup: Throwable) { failure.addSuppressed(cleanup) }
@@ -1194,7 +1195,11 @@ class LocalContainerRuntime internal constructor(
         }
         scope.launch {
             try {
-                while (!tracked.stopping && (if (keeper) process.isAlive else tracked.hasLiveProcesses())) { tracked.refreshDescendants(); delay(300) }
+                while (!tracked.stopping) {
+                    tracked.refreshDescendants()
+                    if (if (keeper) !tracked.isAlive else !tracked.hasLiveProcesses()) break
+                    delay(300)
+                }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
@@ -1415,6 +1420,7 @@ class LocalContainerRuntime internal constructor(
 internal class TrackedProcess(
     val process: Process,
     val keeper: Boolean,
+    ownerScope: CoroutineScope,
     rootIdentity: Pair<Long, String>? = null,
     private val privilegedSnapshot: ((List<Long>) -> List<String>)? = null,
     val terminal: PtyTransport? = null,
@@ -1440,16 +1446,38 @@ internal class TrackedProcess(
     val pid: Long? = rootIdentity?.first ?: findPid(process)
     private val identities = java.util.concurrent.ConcurrentHashMap<Long, String>()
     private var unverifiedRoot: Long? = if (rootIdentity == null) pid else null
-    private var processExited = false
+    @Volatile private var processExited = !process.isAlive
+    @Volatile private var exitFailure: Exception? = null
+    private val exitWatcher: Job
     private var rootLive = emptyList<Long>()
     private var snapshotTime = 0L
     init {
         require(privilegedSnapshot == null || rootIdentity != null) { "Root 进程必须提供已验证身份" }
         if (rootIdentity != null) identities[rootIdentity.first] = rootIdentity.second
-        refreshDescendants()
+        exitWatcher = ownerScope.launch(exitDispatcher) {
+            try {
+                runInterruptible { process.waitFor() }
+                processExited = true
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                exitFailure = failure
+            }
+        }
+        try { refreshDescendants() } catch (failure: Throwable) { exitWatcher.cancel(); throw failure }
     }
 
+    val isAlive: Boolean get() = originalIsAlive()
+
     private fun originalIsAlive(): Boolean {
+        if (processExited) return false
+        // Runtime close cancels waiters before reclaiming processes; cleanup still needs fresh truth.
+        if (exitWatcher.isCancelled || exitFailure != null) return confirmOriginalIsAlive()
+        return !processExited
+    }
+
+    /** Cached liveness never authorizes signaling an opaque/recycled PID or adopting its stat. */
+    private fun confirmOriginalIsAlive(): Boolean {
         if (!processExited && !process.isAlive) processExited = true
         return !processExited
     }
@@ -1460,26 +1488,27 @@ internal class TrackedProcess(
 
     private fun ownsPid(candidate: Long): Boolean {
         if (candidate == pid && !originalIsAlive()) return false
-        if (candidate == unverifiedRoot) return originalIsAlive()
+        if (candidate == unverifiedRoot) return confirmOriginalIsAlive()
         val start = identities[candidate] ?: return false
         return readStat(candidate)?.let { it.start == start && it.state != "Z" } == true
     }
 
     /** No PID-only fallback for descendants or privileged chroot identities. */
     @Synchronized fun terminateFallback(force: Boolean) {
-        if (privilegedSnapshot != null || pid == null || !originalIsAlive()) return
+        if (privilegedSnapshot != null || pid == null || !confirmOriginalIsAlive()) return
         val stat = readStat(pid)
         val start = identities[pid]
         if (stat != null && start != null && stat.start != start) return
-        if (ownsProcessGroup && (stat == null || stat.group == pid && stat.session == pid) && originalIsAlive()) {
+        if (ownsProcessGroup && (stat == null || stat.group == pid && stat.session == pid) && confirmOriginalIsAlive()) {
             groupSignal(pid, force)
         }
-        if ((stat == null || start == null) && originalIsAlive()) {
+        if ((stat == null || start == null) && confirmOriginalIsAlive()) {
             if (force) process.destroyForcibly() else process.destroy()
         }
     }
 
     @Synchronized fun refreshDescendants() {
+        exitFailure?.let { throw IllegalStateException("容器进程退出等待失败：${it.message}", it) }
         if (privilegedSnapshot != null) { refreshPrivileged(true); return }
         val pending = java.util.ArrayDeque<Long>(livePids())
         val seen = mutableSetOf<Long>()
@@ -1524,7 +1553,7 @@ internal class TrackedProcess(
                 val stat = readStat(root)
                 if (stat == null) {
                     if (originalIsAlive()) liveUnverifiedRoot = root
-                } else if (stat.state != "Z" && originalIsAlive()) {
+                } else if (stat.state != "Z" && confirmOriginalIsAlive()) {
                     identities[root] = stat.start
                     unverifiedRoot = null
                 }
@@ -1535,9 +1564,11 @@ internal class TrackedProcess(
         return live
     }
     @Synchronized fun liveIdentities(): List<Pair<Long, String>> = livePids().mapNotNull { pid -> identities[pid]?.let { pid to it } }
-    fun hasLiveProcesses(): Boolean = process.isAlive || livePids().isNotEmpty()
+    fun hasLiveProcesses(): Boolean = originalIsAlive() || livePids().isNotEmpty()
 
     companion object {
+        // Blocking exit waits must not occupy the shared IO slots used by command readers.
+        private val exitDispatcher = Dispatchers.IO.limitedParallelism(Int.MAX_VALUE)
         private data class ProcStat(val pid: Long, val parent: Long, val start: String, val state: String, val group: Long, val session: Long)
         private fun parseStat(text: String): ProcStat? {
             val pid = text.substringBefore(' ').toLongOrNull() ?: return null

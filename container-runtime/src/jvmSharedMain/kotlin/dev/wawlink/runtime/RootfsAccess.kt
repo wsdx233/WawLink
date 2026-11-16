@@ -16,8 +16,8 @@ internal object RootfsAccess {
 
     fun requiresRoot(config: ContainerConfig): Boolean {
         val root = File(config.rootfsPath)
-        val ownership = RootfsOwnership.load(root)
-        if (ownership?.physical == ContainerEngineType.CHROOT || ownership?.pending != null) return true
+        val ownership = RootfsOwnership.status(root)
+        if (ownership?.physical == ContainerEngineType.CHROOT || ownership?.pending == true) return true
         if (ownership == null && config.engine == ContainerEngineType.CHROOT) return true
         return try {
             for (file in listOf(root, File(root, "etc"), File(root, "bin/sh"))) {

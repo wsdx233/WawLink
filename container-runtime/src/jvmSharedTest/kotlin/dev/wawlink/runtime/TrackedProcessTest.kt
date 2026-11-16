@@ -2,6 +2,11 @@ package dev.wawlink.runtime
 
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -9,6 +14,9 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class TrackedProcessTest {
+    private val trackingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    @AfterTest fun closeTracking() { trackingScope.cancel() }
+
     private fun stat(pid: Long): String? = runCatching { File("/proc/$pid/stat").readText() }.getOrNull()
     private fun start(text: String): String = text.substringAfterLast(") ").split(' ')[19]
     private fun reused(text: String): String {
@@ -16,9 +24,14 @@ class TrackedProcessTest {
         fields[19] = (fields[19].toLong() + 1).toString()
         return text.substringBeforeLast(") ") + ") " + fields.joinToString(" ")
     }
-    private fun awaitExit(process: Process) {
+    private fun awaitExit(process: Process, tracked: TrackedProcess? = null) {
         assertTrue(process.waitFor(5, TimeUnit.SECONDS), "Real process did not exit")
         assertFalse(process.isAlive)
+        if (tracked != null) {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (tracked.isAlive && System.nanoTime() < deadline) Thread.sleep(1)
+            assertFalse(tracked.isAlive, "Process exit observation did not complete")
+        }
     }
     private fun withProcess(command: List<String> = listOf("sleep", "60"), block: (Process) -> Unit) {
         val process = ProcessBuilder(command).start()
@@ -39,13 +52,13 @@ class TrackedProcessTest {
 
     @Test fun unreadableStatAllowsARealChildAndOnlyItsProcessAuthorizesTermination() {
         for (force in listOf(false, true)) withProcess { process ->
-            val tracked = TrackedProcess(process, keeper = false, statReader = { throw SecurityException("restricted proc") },
+            val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, statReader = { throw SecurityException("restricted proc") },
                 groupSignal = { _, _ -> error("An ordinary process does not own its group") })
             assertEquals(listOf(process.pid()), tracked.livePids())
             assertTrue(tracked.liveIdentities().isEmpty())
             assertTrue(tracked.hasLiveProcesses())
             tracked.terminateFallback(force)
-            awaitExit(process)
+            awaitExit(process, tracked)
             assertTrue(tracked.livePids().isEmpty())
             assertFalse(tracked.hasLiveProcesses())
         }
@@ -54,7 +67,7 @@ class TrackedProcessTest {
         val pid = process.pid()
         val original = requireNotNull(stat(pid))
         var visible: String? = null
-        val tracked = TrackedProcess(process, keeper = false, statReader = { if (it == pid) visible else stat(it) })
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, statReader = { if (it == pid) visible else stat(it) })
         assertEquals(listOf(pid), tracked.livePids())
         visible = original.substringBeforeLast(") ") + ") Z " + original.substringAfterLast(") ").substringAfter(' ')
         assertTrue(tracked.livePids().isEmpty())
@@ -68,7 +81,7 @@ class TrackedProcessTest {
         val pid = process.pid()
         val original = requireNotNull(stat(pid))
         var visible: String? = null
-        val tracked = TrackedProcess(process, keeper = false, statReader = { if (it == pid) visible else stat(it) })
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, statReader = { if (it == pid) visible else stat(it) })
         assertTrue(tracked.liveIdentities().isEmpty())
         visible = original
         tracked.refreshDescendants()
@@ -87,7 +100,7 @@ class TrackedProcessTest {
         val replacement = reused(requireNotNull(stat(pid)))
         var recovering = false
         var groupSignals = 0
-        val tracked = TrackedProcess(process, keeper = false, ownsProcessGroup = true,
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, ownsProcessGroup = true,
             statReader = {
                 if (recovering && it == pid) {
                     process.destroyForcibly()
@@ -109,7 +122,7 @@ class TrackedProcessTest {
             val original = requireNotNull(stat(pid))
             var visible = if (initiallyReadable) original else null
             var groupSignals = 0
-            val tracked = TrackedProcess(process, keeper = false, ownsProcessGroup = true,
+            val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, ownsProcessGroup = true,
                 statReader = { if (it == pid) visible else stat(it) }, groupSignal = { _, _ -> groupSignals++ })
             process.destroyForcibly()
             awaitExit(process)
@@ -130,7 +143,7 @@ class TrackedProcessTest {
         val pid = process.pid()
         var replacement: String? = null
         try {
-            val tracked = TrackedProcess(process, keeper = false, statReader = {
+            val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, statReader = {
                 when (it) { pid -> null; child -> replacement ?: stat(it); else -> stat(it) }
             })
             assertTrue(child in tracked.livePids())
@@ -152,7 +165,7 @@ class TrackedProcessTest {
     ) { process ->
         val child = process.inputStream.bufferedReader().readLine().toLong()
         val signals = mutableListOf<Pair<Long, Boolean>>()
-        val tracked = TrackedProcess(process, keeper = false, ownsProcessGroup = true, statReader = { null },
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, ownsProcessGroup = true, statReader = { null },
             groupSignal = { pid, force -> signals += pid to force; signal(pid, force) })
         try {
             tracked.terminateFallback(force = false)
@@ -171,7 +184,7 @@ class TrackedProcessTest {
 
     @Test fun readableStatMustConfirmTheClaimedSessionAndGroup() = withProcess { process ->
         var signals = 0
-        val tracked = TrackedProcess(process, keeper = false, ownsProcessGroup = true,
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, ownsProcessGroup = true,
             groupSignal = { _, _ -> signals++ })
         tracked.terminateFallback(force = true)
         assertEquals(0, signals, "A process in the test runner's group must not authorize group signaling")
@@ -179,7 +192,7 @@ class TrackedProcessTest {
     }
 
     @Test fun groupSignalFailuresAreNotReportedAsSuccessfulCleanup() = withProcess { process ->
-        val tracked = TrackedProcess(process, keeper = false, ownsProcessGroup = true, statReader = { null },
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, ownsProcessGroup = true, statReader = { null },
             groupSignal = { _, _ -> throw IllegalStateException("permission denied") })
         assertEquals("permission denied", assertFailsWith<IllegalStateException> { tracked.terminateFallback(force = true) }.message)
         assertTrue(process.isAlive)
@@ -189,7 +202,7 @@ class TrackedProcessTest {
         val original = requireNotNull(stat(process.pid()))
         var snapshot = listOf(original)
         var fallbackSignals = 0
-        val tracked = TrackedProcess(process, keeper = false, rootIdentity = process.pid() to start(original),
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, rootIdentity = process.pid() to start(original),
             privilegedSnapshot = { snapshot }, ownsProcessGroup = true, statReader = { null },
             groupSignal = { _, _ -> fallbackSignals++ })
         assertEquals(listOf(process.pid() to start(original)), tracked.liveIdentities())
@@ -200,7 +213,17 @@ class TrackedProcessTest {
         assertTrue(process.isAlive)
         assertEquals(0, fallbackSignals)
         assertFailsWith<IllegalArgumentException> {
-            TrackedProcess(process, keeper = false, privilegedSnapshot = { emptyList() }, statReader = { null })
+            TrackedProcess(process, keeper = false, ownerScope = trackingScope, privilegedSnapshot = { emptyList() }, statReader = { null })
         }
+    }
+
+    @Test fun cancelledExitObservationStillReclaimsOnlyItsHeldOpaqueProcess() = withProcess { process ->
+        val tracked = TrackedProcess(process, keeper = false, ownerScope = trackingScope, statReader = { null })
+        trackingScope.cancel()
+        assertTrue(tracked.isAlive)
+        tracked.terminateFallback(force = true)
+        awaitExit(process)
+        assertFalse(tracked.hasLiveProcesses())
+        tracked.terminateFallback(force = true)
     }
 }

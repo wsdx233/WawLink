@@ -16,6 +16,7 @@ kotlin {
             dependsOn(commonMain.get())
             dependencies {
                 implementation("org.apache.commons:commons-compress:1.27.1")
+                implementation("com.google.code.gson:gson:2.13.2")
                 implementation("org.tukaani:xz:1.10")
             }
         }
