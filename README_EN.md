@@ -87,18 +87,18 @@ It breaks the boundary of mobile AI coding: with built-in **Proroot / PRoot / ch
 Grab the latest release APK (Android) or desktop build from [Releases](https://github.com/wsdx233/WawLink/releases).
 
 ### 2. Set Up a Container
-- **Online Setup**: Go to the "Containers" tab, pick an online Linux distro (Official or Tsinghua/Ali/USTC mirrors), and let WawLink download and install it.
-- **Custom Import**: Or import your own `rootfs.tar.xz` archive with full or sanitized export options.
+On first launch without a container, open **Sessions → Start Setup → Add Container**. You can also use the **Containers** tab directly:
+
+- **Install a distro**: Choose a Linux distro and a mirror (Official, Tsinghua, Aliyun, or USTC), then download and create the container.
+- **Import rootfs**: Select a local archive or enter its download URL.
 
 The feature debugger reuses Bun for the current guest user: it checks `PATH`, then `${BUN_INSTALL:-$HOME/.bun}/bin/bun` and `/usr/local/bin/bun`, and generates `wawlink-feature` with the same runtime path. If a new container has no Bun yet, setup is deferred without an auxiliary-initialization error or debugger credentials; it can retry on the next Functions visit or Agent startup after Bun is installed. This neither installs Bun automatically nor bypasses OMP's own installation checks. A discovered runtime that cannot execute, permission denials, and file conflicts retain their actual diagnostics.
 
-### 3. Configure Model Providers
-Open **Top-right menu → Model Providers** or **Agent Settings**:
-- Add your LLM API keys (DeepSeek, OpenAI, Claude, Qwen, etc.).
-- Set default model roles and thinking preferences.
+### 3. Prepare OMP and the Default Model
+Return to the setup page (or select **New Session** on the **Sessions** tab). Confirm any required OMP installation or repair, then follow the prompts to configure a model provider and set a default model.
 
 ### 4. Start Coding!
-Create a session on the home screen and tell the Agent what you need. It will autonomously inspect the workspace, plan tasks, write code, and run Linux tools in the container.
+When setup is ready, select **Start Session** and send your first request. If you already have sessions, you can continue creating new ones directly from the **Sessions** tab.
 
 ## Requirements & Environment
 

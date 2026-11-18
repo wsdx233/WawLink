@@ -19,6 +19,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.draw.clip
@@ -41,23 +42,24 @@ internal fun bytesLabel(bytes: Long): String = when {
     val color = when (distro.lowercase()) { "ubuntu" -> Color(0xFFD9460F); "debian" -> Color(0xFFA80030); "alpine" -> Color(0xFF0D597F); "arch" -> Color(0xFF1793D1); "fedora" -> Color(0xFF294172); "kali" -> Color(0xFF268BEE); else -> MaterialTheme.colorScheme.primary }
     Box(Modifier.size(size).background(color, RoundedCornerShape(if (round) size / 2 else size / 3)), contentAlignment = Alignment.Center) { Text(distro.take(1).uppercase(), color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold) }
 }
-@Composable internal fun ContainersHome(app: AppCoordinator, onDetail: (String) -> Unit) {
-    val containers by app.runtime.containers.collectAsState()
+@Composable internal fun ContainersHome(app: AppCoordinator, containers: List<ContainerInfo>, onDetail: (String) -> Unit, onInstall: (Boolean) -> Unit) {
     val deployments by app.runtime.deployments.collectAsState()
     val sessions by app.sessions.collectAsState()
     val selectedContainerId by app.selectedContainerId.collectAsState()
     var query by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf("全部容器") }
     var filterMenu by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(top = 8.dp, bottom = 96.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatTile("${containers.count { it.running }} / ${containers.size}", "运行中容器", "play_circle", Modifier.weight(1f)) { filter = if (filter == "运行中") "全部容器" else "运行中" }
-            StatTile(bytesLabel(containers.sumOf { it.sizeBytes }), "清理包缓存", "hard_drive", Modifier.weight(1f)) { app.launch { val released = app.runtime.cleanPackageCaches(); app.report("已清理包缓存，释放 ${bytesLabel(released)}") } }
-        }
-        Row(Modifier.padding(top = 14.dp).fillMaxWidth().height(56.dp).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(28.dp)).padding(start = 18.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Symbol("search")
-            androidx.compose.foundation.text.BasicTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp), decorationBox = { inner -> if (query.isBlank()) Text("搜索容器或发行版", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp); inner() })
-            Box { AgentIconButton("filter_list", "筛选状态", { filterMenu = true }, filled = filter != "全部容器"); DropdownMenu(filterMenu, { filterMenu = false }) { listOf("全部容器", "运行中", "已停止").forEach { label -> DropdownMenuItem({ Text(label) }, { filter = label; filterMenu = false }, trailingIcon = { if (label == filter) Symbol("check") }) } } }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(top = 8.dp, bottom = if (containers.isEmpty()) 24.dp else 96.dp)) {
+        if (containers.isNotEmpty()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StatTile("${containers.count { it.running }} / ${containers.size}", "运行中容器", "play_circle", Modifier.weight(1f)) { filter = if (filter == "运行中") "全部容器" else "运行中" }
+                StatTile(bytesLabel(containers.sumOf { it.sizeBytes }), "清理包缓存", "hard_drive", Modifier.weight(1f)) { app.launch { val released = app.runtime.cleanPackageCaches(); app.report("已清理包缓存，释放 ${bytesLabel(released)}") } }
+            }
+            Row(Modifier.padding(top = 14.dp).fillMaxWidth().height(56.dp).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(28.dp)).padding(start = 18.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Symbol("search")
+                androidx.compose.foundation.text.BasicTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp), decorationBox = { inner -> if (query.isBlank()) Text("搜索容器或发行版", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp); inner() })
+                Box { AgentIconButton("filter_list", "筛选状态", { filterMenu = true }, filled = filter != "全部容器"); DropdownMenu(filterMenu, { filterMenu = false }) { listOf("全部容器", "运行中", "已停止").forEach { label -> DropdownMenuItem({ Text(label) }, { filter = label; filterMenu = false }, trailingIcon = { if (label == filter) Symbol("check") }) } } }
+            }
         }
         if (deployments.isNotEmpty()) {
             SectionLabel("进行中的操作", "deployed_code")
@@ -90,9 +92,27 @@ internal fun bytesLabel(bytes: Long): String = when {
                 }
             }
         }
+        if (containers.isEmpty()) {
+            if (deployments.none { it.error == null }) {
+                EmptyHost("还没有容器", "deployed_code", "安装 Linux 发行版，或导入已有的 rootfs。") {
+                    HostAction("安装发行版", "add", { onInstall(false) })
+                    TextButton({ onInstall(true) }, Modifier.heightIn(min = 48.dp)) {
+                        Symbol("folder_zip", size = 21.dp)
+                        Spacer(Modifier.width(8.dp))
+                        Text("导入 rootfs", fontSize = 17.sp)
+                    }
+                }
+            }
+            return@Column
+        }
         val visible = containers.filter { c -> (filter != "运行中" || c.running) && (filter != "已停止" || !c.running) && "${c.config.displayName} ${c.config.name} ${c.config.distro} ${c.config.version} ${c.config.metadata.description} ${c.config.metadata.version}".contains(query.trim(), true) }
         SectionLabel("已安装容器", "dns", "${visible.size}")
-        if (visible.isEmpty()) EmptyHost("没有匹配的容器", "deployed_code")
+        if (visible.isEmpty()) {
+            val focus = LocalFocusManager.current
+            EmptyHost("没有匹配的容器", "search_off") {
+                HostAction("清除筛选", "filter_alt_off", { query = ""; filter = "全部容器"; focus.clearFocus() }, tonal = true)
+            }
+        }
         Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
             visible.forEach { c ->
                 val selected = c.config.id == selectedContainerId
@@ -141,17 +161,18 @@ internal fun ContainerOperationProgress(progress: DeploymentProgress, modifier: 
     }
 }
 
-@Composable internal fun InstallContainerScreen(app: AppCoordinator, files: HostFiles, rootfs: Boolean, onBack: () -> Unit) {
-    var tab by rememberSaveable { mutableStateOf(if (rootfs) "导入 rootfs" else "发行版库") }
+@Composable internal fun InstallContainerScreen(app: AppCoordinator, files: HostFiles, rootfs: Boolean, onRootfsChange: (Boolean) -> Unit, onBack: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     var mirror by rememberSaveable { mutableStateOf(MirrorSource.OFFICIAL) }
     var engine by rememberSaveable { mutableStateOf(ContainerEngineType.PROOT) }
     var expanded by rememberSaveable { mutableStateOf<String?>(app.runtime.catalog.firstOrNull()?.id) }
+    val libraryScroll = rememberScrollState()
+    val importScroll = rememberScrollState()
     Column {
         AgentTopBar("添加容器", onBack)
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 40.dp)) {
-            HostChips(listOf("发行版库", "导入 rootfs"), tab, { it }, { tab = it })
-            if (tab == "发行版库") {
+        Column(Modifier.fillMaxSize().verticalScroll(if (rootfs) importScroll else libraryScroll).padding(horizontal = 16.dp).padding(bottom = 40.dp)) {
+            HostChips(listOf(false, true), rootfs, { if (it) "导入 rootfs" else "发行版库" }, onRootfsChange)
+            if (!rootfs) {
                 SectionLabel("运行引擎", "deployed_code")
                 EngineSelector(engine, app.isAndroid) { engine = it }
                 if (engine == ContainerEngineType.CHROOT) Text("chroot 需要系统 Root 权限。无权限时会显示实际错误，请改用 proot。", Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.error, fontSize = 15.sp)

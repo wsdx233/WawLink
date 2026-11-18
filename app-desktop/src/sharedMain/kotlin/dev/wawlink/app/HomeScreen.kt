@@ -14,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.selected
@@ -52,6 +53,9 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
             (filter != "已置顶" || r.pinned) && (environment == null || environment == r.containerId) &&
             (query.isBlank() || "${r.title} ${r.workspace} ${c?.displayName.orEmpty()} ${c?.distro.orEmpty()}".contains(query.trim(), true))
     }
+    val hasSessions = visible.isNotEmpty() || sessions.any { !app.isEmptyDraft(it) }
+    val hasContainers = containers.isNotEmpty()
+    val managing = batch && hasSessions
     fun exitBatch() { batch = false; selected = emptySet() }
     SideEffect {
         navigation?.canLeave = { editing == null && switching == null && deleting.isEmpty() }
@@ -65,20 +69,20 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
     }
     DisposableEffect(navigation) { onDispose { navigation?.onBack = null; navigation?.canLeave = { true } } }
     Scaffold(topBar = {
-        if (tab != 1) AgentTopBar(if (batch) "已选 ${selected.size} 项" else listOf("会话", "功能", "容器")[tab], actions = {
-            if (batch) {
+        if (tab != 1) AgentTopBar(if (managing) "已选 ${selected.size} 项" else listOf("会话", "功能", "容器")[tab], actions = {
+            if (managing) {
                 AgentIconButton("select_all", "全选", { selected = if (visible.all { it.record.id in selected }) selected - visible.map { it.record.id }.toSet() else selected + visible.map { it.record.id } })
                 AgentIconButton("push_pin", "批量置顶", { val ids = selected; app.launch { app.togglePin(ids) }; exitBatch() })
                 AgentIconButton("inventory_2", "批量归档", { val ids = selected; app.launch { app.toggleArchive(ids) }; exitBatch() })
                 AgentIconButton("delete", "批量删除", { deleting = selected })
                 AgentIconButton("close", "退出批量管理", ::exitBatch)
             } else {
-                if (tab == 0) {
+                if (tab == 0 && hasSessions) {
                     val running = sessions.count { it.state.status == SessionStatus.RUNNING && !it.record.archived }
                     if (running > 0) FilledTonalButton({ filter = if (filter == "运行中") "全部" else "运行中" }, contentPadding = PaddingValues(horizontal = 10.dp), modifier = Modifier.height(38.dp)) { Symbol("play_arrow", size = 18.dp); Spacer(Modifier.width(4.dp)); Text("$running") }
                     AgentIconButton("checklist", "批量管理", { expanded = null; batch = true })
                     AgentIconButton("edit_square", "新建会话", onNewSession)
-                } else if (tab == 2) {
+                } else if (tab == 2 && hasContainers) {
                     AgentIconButton("power_settings_new", "当前容器休眠", { currentContainerId?.let { app.launch { app.runtime.stop(it) } } })
                     AgentIconButton("add_box", "添加容器", { onInstall(false) })
                 }
@@ -92,7 +96,7 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
             NavigationBarItem(tab == 2, { tab = 2; exitBatch() }, { Symbol("deployed_code", filled = tab == 2) }, label = { Text("容器", fontSize = 16.sp) }, colors = NavigationBarItemDefaults.colors(indicatorColor = MaterialTheme.colorScheme.primaryContainer, selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer))
         }
     }, floatingActionButton = {
-        if (!batch && tab != 1) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (!managing && (tab == 0 && hasSessions || tab == 2 && hasContainers)) Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             if (tab == 2) ExtendedFloatingActionButton(onClick = { onInstall(true) }, icon = { Symbol("folder_zip") }, text = { Text("导入 rootfs", fontSize = 17.sp) }, containerColor = MaterialTheme.colorScheme.surfaceContainerHigh, shape = RoundedCornerShape(18.dp))
             ExtendedFloatingActionButton(onClick = { if (tab == 0) onNewSession() else onInstall(false) }, icon = { Symbol("add") }, text = { Text(if (tab == 0) "新建会话" else "安装发行版", fontSize = 18.sp) }, shape = RoundedCornerShape(18.dp))
         }
@@ -103,7 +107,11 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
                 (fadeOut(tween(180, easing = EmphAccelEasing)) + slideOutHorizontally(tween(280, easing = EmphAccelEasing)) { if (forward) -it / 5 else it / 5 })
         }) { current ->
             tabStates.SaveableStateProvider(current) {
-            if (current == 0) Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = 96.dp)) {
+            if (current == 0) Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp).padding(bottom = if (hasSessions) 96.dp else 24.dp)) {
+                if (!hasSessions) {
+                    FirstSessionEmpty(app.runtime, hasContainers, onNewSession)
+                    return@Column
+                }
                 Row(Modifier.padding(top = 8.dp, bottom = 6.dp).fillMaxWidth().height(56.dp).background(MaterialTheme.colorScheme.surfaceContainer, RoundedCornerShape(28.dp)).padding(start = 18.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Symbol("search")
                     androidx.compose.foundation.text.BasicTextField(query, { query = it }, Modifier.weight(1f), singleLine = true, textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface, fontSize = 18.sp), decorationBox = { inner -> if (query.isEmpty()) Text("搜索会话或项目", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp); inner() })
@@ -124,7 +132,18 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
                         FilterChip(filter == label, { filter = label }, { Text(label, fontSize = 17.sp) }, leadingIcon = { Symbol(icon, size = 20.dp) }, shape = RoundedCornerShape(if (filter == label) 22.dp else 14.dp), modifier = Modifier.heightIn(min = 44.dp), colors = FilterChipDefaults.filterChipColors(iconColor = MaterialTheme.colorScheme.onSurfaceVariant, selectedContainerColor = MaterialTheme.colorScheme.primaryContainer, selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer, selectedLeadingIconColor = MaterialTheme.colorScheme.onPrimaryContainer), border = FilterChipDefaults.filterChipBorder(enabled = true, selected = filter == label, borderColor = MaterialTheme.colorScheme.outlineVariant))
                     }
                 }
-                if (visible.isEmpty()) EmptyHost("没有匹配的会话")
+                if (visible.isEmpty()) {
+                    if (query.isNotBlank() || filter != "全部" || environment != null) {
+                        val focus = LocalFocusManager.current
+                        EmptyHost("没有匹配的会话", "search_off") {
+                            HostAction("清除筛选", "filter_alt_off", { query = ""; filter = "全部"; environment = null; focus.clearFocus() }, tonal = true)
+                        }
+                    } else {
+                        EmptyHost("没有未归档的会话", "inventory_2") {
+                            HostAction("查看归档", "inventory_2", { filter = "已归档" }, tonal = true)
+                        }
+                    }
+                }
                 val pinned = if (filter != "已归档") visible.filter { it.record.pinned } else emptyList()
                 val recent = visible - pinned.toSet()
                 listOf(Triple("已置顶", "push_pin", pinned), Triple(if (filter == "已归档") "已归档会话" else if (pinned.isNotEmpty()) "最近会话" else "全部会话", "history", recent)).forEach { (title, icon, items) ->
@@ -143,7 +162,7 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
                         }
                     }
                 }
-            } else if (current == 2) ContainersHome(app, onContainer)
+            } else if (current == 2) ContainersHome(app, containers, onContainer, onInstall)
             else key(currentContainerId) { ContainerFeaturesScreen(app, app.features, currentContainerId, onFeature, onExtension, onSettings, navigation = featureNavigation) }
             }
         }
@@ -166,6 +185,26 @@ internal fun HomeScreen(app: AppCoordinator, files: HostFiles, onSettings: () ->
         }
     } }
     if (deleting.isNotEmpty()) AlertDialog(onDismissRequest = { deleting = emptySet() }, title = { Text("删除 ${deleting.size} 个会话？") }, text = { Text("将停止相关进程并永久删除会话历史，无法撤销。") }, confirmButton = { TextButton({ val ids = deleting; deleting = emptySet(); app.launch { app.deleteSessions(ids) }; exitBatch() }) { Text("删除", color = MaterialTheme.colorScheme.error) } }, dismissButton = { TextButton({ deleting = emptySet() }) { Text("取消") } })
+}
+
+@Composable
+private fun FirstSessionEmpty(runtime: ContainerRuntime, hasContainer: Boolean, onNewSession: () -> Unit) {
+    if (hasContainer) {
+        EmptyHost("还没有会话", description = "在当前容器中开始第一个任务。") {
+            HostAction("新建会话", "add", onNewSession)
+        }
+    } else {
+        val deployments by runtime.deployments.collectAsState()
+        if (deployments.any { it.error == null }) {
+            EmptyHost("正在准备容器", "deployed_code") {
+                HostAction("查看准备进度", "checklist", onNewSession)
+            }
+        } else {
+            EmptyHost("开始使用 WawLink", description = "先安装或导入 Linux 容器，再准备 OMP 和默认模型。") {
+                HostAction("开始设置", "checklist", onNewSession)
+            }
+        }
+    }
 }
 
 @Composable private fun RunningIndicator() {

@@ -18,6 +18,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -46,7 +47,6 @@ private data class HostRoute(
     val page: String,
     val sessionId: String? = null,
     val containerId: String? = null,
-    val rootfs: Boolean = false,
     val installationId: String? = null,
     val returnPage: String = "home",
     val resourceWorkspace: String? = null,
@@ -60,7 +60,6 @@ private data class HostRoute(
         "plugins", "skills" -> "$page:$containerId:${resourceWorkspace ?: "user"}:$sessionId:$initialResource"
         "extension" -> "extension:$containerId:${feature?.id}"
         "terminal" -> "terminal:$containerId:${installationId ?: "shell"}"
-        "install" -> "install:$rootfs"
         else -> page
     }
 }
@@ -191,9 +190,14 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
     }
     SideEffect { navigation?.onBack = ::goBack }
     DisposableEffect(navigation) { onDispose { navigation?.onBack = null } }
+    fun openInstall(rootfs: Boolean, returnPage: String = "home") {
+        installRootfs = rootfs
+        installReturn = returnPage
+        page = "install"
+    }
     fun createNew(containerId: String? = null) {
         if (creatingInContext) return
-        if (app.currentContainerId() == null) { installRootfs = false; page = "install"; app.report("请先安装或导入一个容器"); return }
+        if (app.currentContainerId() == null) { openInstall(false); app.report("请先安装或导入一个容器"); return }
         creatingInContext = true
         app.launch {
             try {
@@ -237,7 +241,7 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
         "extension" -> HostRoute(page, containerId = selectedContainer, feature = activeFeature)
         "terminal" -> HostRoute(page, containerId = selectedContainer, installationId = terminalInstallationId, returnPage = terminalReturn)
         "files" -> HostRoute(page, containerId = selectedContainer, returnPage = filesReturn)
-        "install" -> HostRoute(page, rootfs = installRootfs, returnPage = installReturn)
+        "install" -> HostRoute(page, returnPage = installReturn)
         "readiness" -> HostRoute(page, returnPage = readinessReturn)
         "about", "keepalive" -> HostRoute(page, returnPage = "appearance")
         else -> HostRoute(page)
@@ -269,7 +273,7 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                             "home" -> HomeScreen(app, files, onSettings = { selectedContainer = app.currentContainerId(); page = "appearance" }, onNewSession = ::openNew,
                                 onEnterSession = { selectedSession = it; page = "chat" },
                                 onContainer = { selectedContainer = it; page = "container" },
-                                onInstall = { installRootfs = it; installReturn = "home"; page = "install" }, onFeature = ::openFeature,
+                                onInstall = { openInstall(it) }, onFeature = ::openFeature,
                                 onExtension = { feature -> selectedContainer = app.currentContainerId(); activeFeature = feature; page = "extension" }, navigation = homeNavigation,
                                 onSearchContents = { id -> selectedContainer = id; page = "content-search" })
                             "content-search" -> current.containerId?.let { containerId ->
@@ -364,9 +368,9 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
                                 { page = "keepalive" }, { page = "about" }, { readinessReturn = "appearance"; page = "readiness" })
                             "about" -> AboutScreen({ page = "appearance" }, app::showError)
                             "keepalive" -> KeepAliveScreen(app, files, { page = "appearance" })
-                            "install" -> InstallContainerScreen(app, files, current.rootfs, { page = current.returnPage })
+                            "install" -> InstallContainerScreen(app, files, installRootfs, onRootfsChange = { installRootfs = it }, onBack = { page = current.returnPage })
                             "readiness" -> SessionReadinessScreen(app, onBack = { page = current.returnPage },
-                                onInstallContainer = { installRootfs = false; installReturn = "readiness"; page = "install" },
+                                onInstallContainer = { openInstall(false, "readiness") },
                                 onConfigureModels = { id -> selectedContainer = id; resourceWorkspace = "/workspace"; settingsReturn = "readiness"; page = "providers" },
                                 onConfigureAgent = { id -> selectedContainer = id; resourceWorkspace = "/workspace"; definitionName = null; settingsReturn = "readiness"; page = "management" },
                                 onRequestOmpInstall = app::requestOmpInstallation,
@@ -456,10 +460,15 @@ fun WawLinkApp(app: AppCoordinator, files: HostFiles, navigation: HostNavigation
 @Composable private fun MissingContainer(onBack: () -> Unit) { Column { AgentTopBar("容器不存在", onBack); EmptyHost("请先安装或导入容器") } }
 
 @Composable
-internal fun EmptyHost(text: String, icon: String = "forum") {
+internal fun EmptyHost(text: String, icon: String = "forum", description: String? = null, actions: @Composable () -> Unit = {}) {
     Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Symbol(icon, size = 48.dp, tint = MaterialTheme.colorScheme.outline)
-        Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp)
+        if (description == null) Text(text, color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 18.sp)
+        else {
+            Text(text, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
+            Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+        }
+        actions()
     }
 }
 @Composable internal fun SectionLabel(title: String, icon: String = "tune", count: String? = null, action: (@Composable () -> Unit)? = null) {
