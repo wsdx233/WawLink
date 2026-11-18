@@ -46,7 +46,7 @@ internal object DistroSources {
         "arch" to ("archlinux" to "dc56b998ffa2663209417396c8d70caf87c8052acf41e9a2c6daf24cbd181533"),
         "fedora" to ("fedora" to "5f51f3f2da790732fc6b720eefe5ec44841cf8edb21dfa342005257c4665bb8c"),
     )
-    private val snapshotLink = Regex("href=[\"']([0-9]{8}_[0-9]{2}(?::|%3[Aa])[0-9]{2})/[\"']")
+    private val snapshotLink = Regex("""\shref\s*=\s*(['"])(?:\./)?([0-9]{8}_[0-9]{2}(?::|%3a)[0-9]{2})/\1""", RegexOption.IGNORE_CASE)
     private val encodedColon = Regex("%3[Aa]")
     private val checksumColumns = Regex("\\s+")
     private val sha256Pattern = Regex("[0-9a-fA-F]{64}")
@@ -60,7 +60,9 @@ internal object DistroSources {
     }
 
     internal fun resolve(spec: DistroSpec, mirror: MirrorSource, metadata: (String) -> String): DistroDownload {
-        require(spec in catalog) { "不支持的发行版版本或架构：${spec.id} ${spec.version} ${spec.arch}" }
+        require(catalog.any { it.id == spec.id && it.version == spec.version && it.arch == spec.arch }) {
+            "不支持的发行版版本或架构：${spec.id} ${spec.version} ${spec.arch}"
+        }
         require(spec.id != "fedora" || mirror == MirrorSource.OFFICIAL) {
             "Fedora 41 缺少可校验的国内 ARM64 rootfs 归档；国内现有 OCI/虚拟机镜像不能直接导入。请选择官方源，不会自动切换源或升级版本"
         }
@@ -68,8 +70,8 @@ internal object DistroSources {
             val base = "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cdimage/ubuntu-base/releases/24.04/release"
             val filename = "ubuntu-base-24.04.5-base-arm64.tar.gz"
             val pinned = "a91d5a93010193712d346d761372b7c9db6dfcf093893161c64ca107f05914f2"
-            require(checksum(metadata("$base/SHA256SUMS"), filename) == pinned) { "清华 Ubuntu Base SHA256 与固定校验值不符" }
-            return DistroDownload("$base/$filename", pinned, "下载清华 Ubuntu Base 24.04.5 rootfs（固定 SHA256，清华元数据）；${mirror.label}用于软件源")
+            // A pinned digest already identifies the exact archive; no live checksum list is needed.
+            return DistroDownload("$base/$filename", pinned, "下载清华 Ubuntu Base 24.04.5 rootfs（固定 SHA256）；${mirror.label}用于软件源")
         }
         if (mirror != MirrorSource.OFFICIAL && (spec.id == "debian" || spec.id == "arch" || spec.id == "kali")) {
             // Only the rootfs member is importable; disk.qcow2, metadata and OCI bundles are not root filesystems.
@@ -80,7 +82,7 @@ internal object DistroSources {
             }
             val base = "https://mirrors.tuna.tsinghua.edu.cn/lxc-images/images/$branch/arm64/default"
             val snapshot = snapshotLink.findAll(metadata("$base/"))
-                .map { it.groupValues[1].replace(encodedColon, ":") }
+                .map { it.groupValues[2].replace(encodedColon, ":") }
                 .maxOrNull() ?: error("清华 ${spec.name} 元数据缺少 ARM64 rootfs 快照")
             val directory = "$base/${snapshot.replace(":", "%3A")}"
             val filename = "rootfs.tar.xz"
@@ -103,8 +105,7 @@ internal object DistroSources {
             val directory = "$base/v3.21/releases/aarch64"
             val filename = "alpine-minirootfs-3.21.9-aarch64.tar.gz"
             val pinned = "a389940ee42579ead202fb91607fb25698a58a3a5b55c15b4603e5d39cfa4492"
-            require(checksum(metadata("$directory/$filename.sha256"), filename) == pinned) { "${mirror.label} Alpine minirootfs SHA256 与固定校验值不符" }
-            return DistroDownload("$directory/$filename", pinned, "下载${mirror.label} Alpine 3.21.9 minirootfs（固定 SHA256，同源元数据）")
+            return DistroDownload("$directory/$filename", pinned, "下载${mirror.label} Alpine 3.21.9 minirootfs（固定 SHA256）")
         }
         val base = "https://kali.download/nethunter-images/current/rootfs"
         val filename = "kali-nethunter-rootfs-minimal-arm64.tar.xz"
@@ -112,12 +113,16 @@ internal object DistroSources {
     }
 
     private fun checksum(metadata: String, filename: String): String {
-        val records = metadata.lineSequence().map { it.trim().split(checksumColumns) }
-            .filter { it.size == 2 && it[1].removePrefix("*") == filename }.toList()
-        require(records.size == 1 && sha256Pattern.matches(records.single()[0])) {
-            "SHA256 元数据缺少唯一有效的 $filename 记录"
+        var checksum: String? = null
+        for (line in metadata.lineSequence()) {
+            val fields = line.removePrefix("\uFEFF").trim().split(checksumColumns, limit = 2)
+            if (fields.size != 2 || fields[1].removePrefix("*").removePrefix("./") != filename) continue
+            val value = fields[0]
+            require(sha256Pattern.matches(value)) { "SHA256 元数据的 $filename 校验值无效" }
+            require(checksum == null || value.equals(checksum, ignoreCase = true)) { "SHA256 元数据的 $filename 校验值冲突" }
+            if (checksum == null) checksum = value.lowercase()
         }
-        return records.single()[0].lowercase()
+        return requireNotNull(checksum) { "SHA256 元数据缺少 $filename 记录" }
     }
 
     internal fun redirectTarget(current: URI, location: String, domesticHost: String?): URI {

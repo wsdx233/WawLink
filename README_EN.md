@@ -92,6 +92,8 @@ On first launch without a container, open **Sessions → Start Setup → Add Con
 - **Install a distro**: Choose a Linux distro and a mirror (Official, Tsinghua, Aliyun, or USTC), then download and create the container.
 - **Import rootfs**: Select a local archive or enter its download URL.
 
+Images with a pinned SHA256 are verified directly against that digest without fetching a live checksum manifest. Unpinned images still require an unambiguous SHA256, and installs do not silently switch mirrors or upgrade releases. A rootfs archive may be flat or use a single enclosing directory. Device nodes and FIFOs under the guest's `/dev` are skipped; path escapes, conflicts, and archive checksum mismatches still fail. Import reads `/etc/os-release` first, falls back to `/usr/lib/os-release` when absent, and labels missing distro or version fields as `custom`.
+
 The feature debugger reuses Bun for the current guest user: it checks `PATH`, then `${BUN_INSTALL:-$HOME/.bun}/bin/bun` and `/usr/local/bin/bun`, and generates `wawlink-feature` with the same runtime path. If a new container has no Bun yet, setup is deferred without an auxiliary-initialization error or debugger credentials; it can retry on the next Functions visit or Agent startup after Bun is installed. This neither installs Bun automatically nor bypasses OMP's own installation checks. A discovered runtime that cannot execute, permission denials, and file conflicts retain their actual diagnostics.
 
 ### 3. Prepare OMP and the Default Model

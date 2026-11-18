@@ -92,6 +92,26 @@ class RootfsImportTest {
         assertFails { runtime.importRootfs(inspection.id, "Another") }
     } }
 
+    @Test fun releaseMetadataUsesVendorFileWithoutOverridingLocalFile() = fixture { directory, runtime -> runBlocking {
+        val variants = listOf(
+            Triple(null, "arch", "rolling"),
+            Triple("ID=ubuntu\nVERSION_ID=\"24.04\"\n", "ubuntu", "24.04"),
+            Triple("ID=''\nVERSION_ID=\" \"\n", "custom", "custom"),
+        )
+        variants.forEachIndexed { index, (local, distro, version) ->
+            val source = root(directory, "image-$index")
+            val sourceRoot = File(source.rootfsPath)
+            if (local == null) File(sourceRoot, "etc/os-release").delete() else put(sourceRoot, "etc/os-release", local)
+            put(sourceRoot, "usr/lib/os-release", "\uFEFFID = archarm\r\n  VERSION_ID = 'rolling'\r\n")
+            val name = "imported-$index"
+            val inspection = runtime.inspectRootfsArchive(archive(directory, source).path, name)
+            val imported = runtime.importRootfs(inspection.id, name)
+            assertEquals(distro, imported.distro)
+            assertEquals(version, imported.version)
+            assertEquals("amd64", imported.arch)
+        }
+    } }
+
     @Test fun titleConflictAndMultipleTargetsRequireAnActuallyConflictingUpdateChoice() = fixture { directory, runtime -> runBlocking {
         val one = root(directory, "one", "First")
         val two = root(directory, "two", "Second")

@@ -76,6 +76,7 @@ internal object RootfsArchives {
         val root = requestedRoot.toRealPath()
         val hardlinks = mutableListOf<Pair<Path, Path>>()
         val symlinks = mutableListOf<Pair<Path, String>>()
+        val specialEntries = mutableMapOf<Path, String>()
         val directoryModes = mutableListOf<Pair<Path, Int>>()
         val owners = linkedMapOf<Path, LogicalOwner>()
         var bytes = 0L
@@ -88,19 +89,21 @@ internal object RootfsArchives {
                 require(tar.canReadEntryData(entry)) { "归档包含不支持的文件格式：${entry.name}" }
                 val owner = LogicalOwner(entry.longUserId, entry.longGroupId, entry.mode and 0xFFF)
                 require(owner.uid >= 0 && owner.gid >= 0) { "归档包含非法 UID/GID：${entry.name}" }
+                val isSpecial = entry.isCharacterDevice || entry.isBlockDevice || entry.isFIFO
+                val isDirectory = !isSpecial && entry.isDirectory
                 if (target == root) {
-                    require(entry.isDirectory) { "归档根路径不是目录" }
+                    require(isDirectory) { "归档根路径不是目录" }
                     owners[root] = owner
                     directoryModes += root to owner.mode
                     continue
                 }
                 noLinkParents(root, target.parent)
                 Files.createDirectories(target.parent)
-                require(!Files.exists(target, NOFOLLOW_LINKS) || (entry.isDirectory && Files.isDirectory(target, NOFOLLOW_LINKS))) {
+                require(target !in specialEntries && (!Files.exists(target, NOFOLLOW_LINKS) || (isDirectory && Files.isDirectory(target, NOFOLLOW_LINKS)))) {
                     "归档包含重复或冲突路径：${entry.name}"
                 }
                 when {
-                    entry.isDirectory -> {
+                    isDirectory -> {
                         Files.createDirectories(target)
                         directoryModes += target to entry.mode
                         owners[target] = owner
@@ -111,7 +114,8 @@ internal object RootfsArchives {
                         owners[target] = owner
                     }
                     entry.isLink -> hardlinks += target to member(root, entry.linkName.removePrefix("./"))
-                    entry.isFile && !entry.isFIFO && !entry.isCharacterDevice && !entry.isBlockDevice -> {
+                    isSpecial -> specialEntries[target] = entry.name
+                    entry.isFile -> {
                         Files.newOutputStream(target).use { output ->
                             while (true) {
                                 checkActive()
@@ -126,8 +130,6 @@ internal object RootfsArchives {
                         if (entry.lastModifiedDate.time > 0) target.toFile().setLastModified(entry.lastModifiedDate.time)
                         owners[target] = owner
                     }
-                    // /dev is provided by the engine; never create privileged device nodes on the host.
-                    (entry.isCharacterDevice || entry.isBlockDevice || entry.isFIFO) && root.relativize(target).firstOrNull()?.toString() == "dev" -> Unit
                     else -> error("归档含不支持的特殊文件：${entry.name}")
                 }
             }
@@ -164,17 +166,22 @@ internal object RootfsArchives {
             }
             require(resolved) { "归档包含循环或缺失目标的硬链接" }
         }
-        // Flatten the distributor wrapper BEFORE rebasing guest-absolute symlinks.
-        var wrapperRoot: Path? = null
-        val extracted = root.toFile()
-        if (!File(extracted, "etc").isDirectory) {
-            val children = extracted.listFiles().orEmpty()
-            if (children.size == 1 && children[0].isDirectory && File(children[0], "etc").isDirectory) {
-                val wrapper = children[0]
-                wrapperRoot = wrapper.toPath().toAbsolutePath().normalize()
-                wrapper.listFiles().orEmpty().forEach { Files.move(it.toPath(), root.resolve(it.name)) }
-                Files.delete(wrapper.toPath())
+        // Use the same root for device checks and link rebasing, regardless of tar entry order.
+        val wrapperRoot = if (Files.isDirectory(root.resolve("etc"), NOFOLLOW_LINKS)) null else {
+            root.toFile().listFiles()?.singleOrNull()?.toPath()?.takeIf {
+                Files.isDirectory(it, NOFOLLOW_LINKS) && Files.isDirectory(it.resolve("etc"), NOFOLLOW_LINKS)
             }
+        }
+        val dev = (wrapperRoot ?: root).resolve("dev")
+        for ((target, name) in specialEntries) {
+            checkActive()
+            // The engine provides /dev; never materialize device nodes or FIFOs on the host.
+            check(target != dev && target.startsWith(dev)) { "归档含不支持的特殊文件：$name" }
+            require(!Files.exists(target, NOFOLLOW_LINKS)) { "归档包含重复或冲突路径：$name" }
+        }
+        if (wrapperRoot != null) {
+            wrapperRoot.toFile().listFiles().orEmpty().forEach { Files.move(it.toPath(), root.resolve(it.name)) }
+            Files.delete(wrapperRoot)
         }
         fun relocated(path: Path): Path = wrapperRoot?.let { wrapper ->
             require(path.startsWith(wrapper)) { "归档链接位于 rootfs 包装目录之外" }
@@ -187,7 +194,7 @@ internal object RootfsArchives {
             else target.parent.resolve(linkName)
             require(linked.normalize().startsWith(root)) { "符号链接逃逸 rootfs：$original" }
             noLinkParents(root, target.parent)
-            require(!Files.exists(target, NOFOLLOW_LINKS)) { "归档包含冲突符号链接：$original" }
+            require(original !in specialEntries && !Files.exists(target, NOFOLLOW_LINKS)) { "归档包含冲突符号链接：$original" }
             val relative = if (linkName.startsWith('/')) target.parent.relativize(root).resolve(linkName.trimStart('/')) else java.nio.file.Paths.get(linkName)
             Files.createSymbolicLink(target, relative)
         }

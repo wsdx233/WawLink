@@ -744,7 +744,7 @@ class LocalContainerRuntime internal constructor(
             check(distroDeployments[task.id] === task && task.owner == null && (!retry || task.failed)) { "下载任务正在运行或已结束" }
             task.owner = owner; task.failed = false; task.cancelling = false; task.finalizing = false; task.committed = false
             task.transfer = DistroTransferControl { context.ensureActive() }
-            deployment(DeploymentProgress(task.id, task.name, null, "读取发行者 SHA256 元数据"))
+            deployment(DeploymentProgress(task.id, task.name, null, "确定镜像与 SHA256 校验值"))
         }
         try {
             val source = resolveDistro(task.distro, task.mirror, requireNotNull(task.transfer))
@@ -824,8 +824,10 @@ class LocalContainerRuntime internal constructor(
             }
             report("检查发行版、ELF 与容器信息", null)
             val os = readOsRelease(staged.root)
-            val distro = when (os["ID"]) { "archarm", "arch" -> "arch"; else -> os["ID"] ?: "custom" }
-            val candidate = ContainerConfig(id, requestedName, staged.root.canonicalPath, distro, os["VERSION_ID"] ?: "custom", detectArch(staged.root), engine,
+            val osId = os["ID"]?.takeIf(String::isNotBlank) ?: "custom"
+            val distro = if (osId == "archarm") "arch" else osId
+            val version = os["VERSION_ID"]?.takeIf(String::isNotBlank) ?: "custom"
+            val candidate = ContainerConfig(id, requestedName, staged.root.canonicalPath, distro, version, detectArch(staged.root), engine,
                 link2symlink = paths.isAndroid, shell = if (File(staged.root, "bin/bash").let { it.isFile && it.canExecute() }) "/bin/bash" else "/bin/sh")
             engines.validateRoot(candidate)
             // Invalid portable metadata remains repairable, as for ordinary offline registration.
@@ -1006,7 +1008,6 @@ class LocalContainerRuntime internal constructor(
                 val now = System.nanoTime()
                 if (now - lastUpdate > 100_000_000) { deployment(DeploymentProgress(id, name, null, "安全解压中 · ${bytes / 1024 / 1024} MB")); lastUpdate = now }
             }
-            readOsRelease(target)
             val distroId = distro.id
             DistroSources.configure(target, distroId, mirror)
             val config = ContainerConfig(id, name, target.canonicalPath, distroId, distro.version, distro.arch, task.engine, link2symlink = paths.isAndroid, shell = if (File(target, "bin/bash").exists()) "/bin/bash" else "/bin/sh")
@@ -1029,9 +1030,18 @@ class LocalContainerRuntime internal constructor(
     }
 
     private fun readOsRelease(root: File): Map<String, String> {
-        val file = File(root, "etc/os-release")
-        require(file.canonicalFile.toPath().startsWith(root.canonicalFile.toPath())) { "os-release 路径越界" }
-        return file.takeIf { it.isFile }?.readLines()?.filter { it.contains('=') && !it.startsWith('#') }?.associate { it.substringBefore('=') to it.substringAfter('=').trim().trim('"', '\'') }.orEmpty()
+        val rootPath = root.canonicalFile.toPath()
+        fun locate(relative: String): File? {
+            val file = File(root, relative).canonicalFile
+            require(file.toPath().startsWith(rootPath)) { "$relative 路径越界" }
+            return file.takeIf { it.isFile }
+        }
+        // The os-release spec uses /usr/lib only when /etc has no file; never merge the two.
+        val file = locate("etc/os-release") ?: locate("usr/lib/os-release") ?: return emptyMap()
+        return file.useLines { lines ->
+            lines.map { it.removePrefix("\uFEFF").trimStart() }.filter { it.contains('=') && !it.startsWith('#') }
+                .associate { it.substringBefore('=').trimEnd() to it.substringAfter('=').trim().trim('"', '\'') }
+        }
     }
     private fun detectArch(root: File): String {
         val shell = File(root, "bin/sh").canonicalFile

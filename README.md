@@ -92,6 +92,8 @@ WawLink 是基于 Kotlin Multiplatform、Compose Multiplatform 与 Material 3 �
 - **安装发行版**：选择 Linux 发行版及镜像源（官方、清华、阿里或中科大），下载并创建容器。
 - **导入 rootfs**：选择已有的本地归档，或填写归档的下载链接。
 
+内置固定 SHA256 的镜像直接校验下载归档，不依赖在线校验清单；未固定的镜像仍需取得明确的 SHA256，不会自动换源或升级。归档可以直接包含 rootfs，也可以套一层独立的包装目录。归档中容器 `/dev` 下的设备节点与 FIFO 不会被创建；路径越界、冲突或归档校验失败仍会中止。导入识别发行版时优先读取 `/etc/os-release`，缺失时读取 `/usr/lib/os-release`；未提供的发行版或版本字段标记为 `custom`。
+
 功能调试器复用当前容器用户已有的 Bun：先查 `PATH`，再查 `${BUN_INSTALL:-$HOME/.bun}/bin/bun` 和 `/usr/local/bin/bun`，生成的 `wawlink-feature` 使用同一路径。新容器尚无 Bun 时暂缓安装，不弹辅助初始化错误、不写调试凭据；安装 Bun 后，下次进入功能页或启动 Agent 时可重试。不自动安装 Bun，不以此跳过 OMP 自身的安装检查；已发现的 Bun 无法执行、权限拒绝或文件冲突仍保留真实诊断。
 
 ### 3. 准备 OMP 和默认模型

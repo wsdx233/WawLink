@@ -17,42 +17,26 @@ class DistroSourcesTest {
     private val alpineHash = "a389940ee42579ead202fb91607fb25698a58a3a5b55c15b4603e5d39cfa4492"
     private val tuna = "https://mirrors.tuna.tsinghua.edu.cn"
     private fun distro(id: String) = DistroSources.catalog.single { it.id == id }
-    private fun alpineMetadata(filename: String = "alpine-minirootfs-3.21.9-aarch64.tar.gz") = "$alpineHash  $filename"
 
-    @Test fun domesticUbuntuUsesDomesticBaseArchiveAndMetadataWithoutChangingRelease() {
+    @Test fun domesticUbuntuUsesPinnedBaseWithoutAnOnlineManifestOrReleaseChange() {
         domestic.forEach { mirror ->
-            val requests = mutableListOf<String>()
-            val source = DistroSources.resolve(distro("ubuntu"), mirror) { url ->
-                requests += url
-                """
-                    $ubuntuHash *ubuntu-base-24.04.5-base-arm64.tar.gz
-                    ${"b".repeat(64)} *ubuntu-base-24.04.10-base-arm64.tar.gz
-                    ${"c".repeat(64)} *ubuntu-base-26.04-base-arm64.tar.gz
-                    ${"d".repeat(64)} *ubuntu-base-24.04.11-base-amd64.tar.gz
-                """.trimIndent()
-            }
+            val source = DistroSources.resolve(distro("ubuntu"), mirror) { error("Pinned archive needs no manifest: $it") }
             val base = "$tuna/ubuntu-cdimage/ubuntu-base/releases/24.04/release"
-            assertEquals(listOf("$base/SHA256SUMS"), requests)
             assertEquals("$base/ubuntu-base-24.04.5-base-arm64.tar.gz", source.url)
             assertEquals(ubuntuHash, source.sha256)
         }
     }
 
-    @Test fun domesticAlpineGetsMetadataAndArchiveFromSelectedMirror() {
-        domestic.forEach { mirror ->
+    @Test fun alpineUsesPinnedArchiveWithoutAnOnlineManifestOnEachMirror() {
+        MirrorSource.entries.forEach { mirror ->
             val host = when (mirror) {
                 MirrorSource.TSINGHUA -> "mirrors.tuna.tsinghua.edu.cn"
                 MirrorSource.ALIYUN -> "mirrors.aliyun.com"
-                else -> "mirrors.ustc.edu.cn"
+                MirrorSource.USTC -> "mirrors.ustc.edu.cn"
+                MirrorSource.OFFICIAL -> "dl-cdn.alpinelinux.org"
             }
-            val base = "https://$host/alpine/v3.21/releases/aarch64"
-            val requests = mutableListOf<String>()
-            val source = DistroSources.resolve(distro("alpine"), mirror) { url ->
-                requests += url
-                alpineMetadata()
-            }
-            assertEquals(listOf("$base/alpine-minirootfs-3.21.9-aarch64.tar.gz.sha256"), requests)
-            assertEquals("$base/alpine-minirootfs-3.21.9-aarch64.tar.gz", source.url)
+            val source = DistroSources.resolve(distro("alpine"), mirror) { error("Pinned archive needs no manifest: $it") }
+            assertEquals("https://$host/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.9-aarch64.tar.gz", source.url)
             assertEquals(alpineHash, source.sha256)
         }
     }
@@ -67,15 +51,16 @@ class DistroSourcesTest {
                 when (url) {
                     "$base/" -> """
                         <a href="20261020_05%3A24/">old</a>
-                        <a href="20261022_05:24/">latest</a>
+                        <a HREF = './20261022_05:24/'>latest</a>
                         <a href="https://overseas.invalid/20990101_01:01/">not a local snapshot</a>
                         <a href="../20990101_01:01/">not a child</a>
                         <a href="20261021_06%3a02/">middle</a>
                     """.trimIndent()
-                    "$base/20261022_05%3A24/SHA256SUMS" -> """
+                    "$base/20261022_05%3A24/SHA256SUMS" -> "\uFEFF" + """
                         ${"b".repeat(64)}  disk.qcow2
                         ${"c".repeat(64)}  meta.tar.xz
-                        ${hash.uppercase()}  rootfs.tar.xz
+                        ${hash.uppercase()}  *./rootfs.tar.xz
+                        $hash  rootfs.tar.xz
                     """.trimIndent()
                     else -> error("Unexpected metadata URL: $url")
                 }
@@ -95,7 +80,7 @@ class DistroSourcesTest {
     }
 
     @Test fun missingOrInvalidChecksumsNeverProduceAnUnverifiedDownload() {
-        val invalid = listOf("", "not-a-hash  rootfs.tar.xz", "$hash  disk.qcow2", "$hash  rootfs.tar.xz\n$hash  rootfs.tar.xz")
+        val invalid = listOf("", "not-a-hash  rootfs.tar.xz", "$hash  disk.qcow2", "$hash  rootfs.tar.xz\n${"b".repeat(64)}  ./rootfs.tar.xz")
         invalid.forEach { sums ->
             assertFailsWith<IllegalArgumentException> {
                 DistroSources.resolve(distro("debian"), MirrorSource.ALIYUN) { url ->
@@ -103,28 +88,14 @@ class DistroSourcesTest {
                 }
             }
         }
-        assertFailsWith<IllegalArgumentException> {
-            DistroSources.resolve(distro("ubuntu"), MirrorSource.USTC) { "$hash *ubuntu-base-26.04-base-arm64.tar.gz" }
-        }
         assertFailsWith<IllegalStateException> {
             DistroSources.resolve(distro("kali"), MirrorSource.TSINGHUA) { "<a href=\"https://overseas.invalid/image/\">image</a>" }
-        }
-        assertFailsWith<IllegalArgumentException> {
-            DistroSources.resolve(distro("alpine"), MirrorSource.TSINGHUA) {
-                alpineMetadata("alpine-minirootfs-3.22.0-aarch64.tar.gz")
-            }
-        }
-        assertFailsWith<IllegalArgumentException> {
-            DistroSources.resolve(distro("ubuntu"), MirrorSource.TSINGHUA) { "$hash *ubuntu-base-24.04.5-base-arm64.tar.gz" }
-        }
-        assertFailsWith<IllegalArgumentException> {
-            DistroSources.resolve(distro("alpine"), MirrorSource.ALIYUN) { "$hash  alpine-minirootfs-3.21.9-aarch64.tar.gz" }
         }
     }
 
     @Test fun failedDomesticMetadataNeverRetriesOfficialServers() {
         domestic.forEach { mirror ->
-            listOf("ubuntu", "debian", "arch", "alpine", "kali").forEach { id ->
+            listOf("debian", "arch", "kali").forEach { id ->
                 val requests = mutableListOf<String>()
                 assertFailsWith<java.io.IOException> {
                     DistroSources.resolve(distro(id), mirror) { url ->
@@ -138,18 +109,20 @@ class DistroSourcesTest {
         }
     }
 
-    @Test fun officialAlpineAndKaliUseTheirOfficialMetadata() {
-        val alpine = DistroSources.resolve(distro("alpine"), MirrorSource.OFFICIAL) { url ->
-            assertEquals("https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.9-aarch64.tar.gz.sha256", url)
-            alpineMetadata()
-        }
-        assertEquals("https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.9-aarch64.tar.gz", alpine.url)
+    @Test fun officialKaliUsesOfficialChecksumManifest() {
         val kali = DistroSources.resolve(distro("kali"), MirrorSource.OFFICIAL) { url ->
             assertEquals("https://kali.download/nethunter-images/current/rootfs/SHA256SUMS", url)
-            "$hash *kali-nethunter-rootfs-minimal-arm64.tar.xz"
+            "\uFEFF${hash.uppercase()}\t*./kali-nethunter-rootfs-minimal-arm64.tar.xz"
         }
         assertEquals("https://kali.download/nethunter-images/current/rootfs/kali-nethunter-rootfs-minimal-arm64.tar.xz", kali.url)
         assertEquals(hash, kali.sha256)
+    }
+
+    @Test fun displayLabelsDoNotChangeDistroIdentity() {
+        val localized = distro("ubuntu").copy(name = "本地化名称", icon = "terminal")
+        val source = DistroSources.resolve(localized, MirrorSource.TSINGHUA) { error("Unexpected metadata request: $it") }
+        assertEquals("$tuna/ubuntu-cdimage/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.5-base-arm64.tar.gz", source.url)
+        assertEquals(ubuntuHash, source.sha256)
     }
 
     @Test fun rejectsUncataloguedVersionsAndArchitectures() {

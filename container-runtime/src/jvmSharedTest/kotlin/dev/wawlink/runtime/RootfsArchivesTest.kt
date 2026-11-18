@@ -44,6 +44,9 @@ class RootfsArchivesTest {
     }
     private fun link(name: String, target: String) = TarArchiveEntry(name, TarConstants.LF_SYMLINK).apply { linkName = target } to ""
     private fun hardlink(name: String, target: String) = TarArchiveEntry(name, TarConstants.LF_LINK).apply { linkName = target } to ""
+    private fun special(name: String, type: Byte) = TarArchiveEntry(name, type).apply {
+        if (isCharacterDevice || isBlockDevice) { devMajor = 5; devMinor = 1 }
+    } to ""
 
     @Test fun concurrentDeploymentUpdatesPreserveOtherRowsAndInsertionOrder() = fixture { directory ->
         val releases = listOf(CountDownLatch(1), CountDownLatch(1))
@@ -251,6 +254,49 @@ class RootfsArchivesTest {
         assertEquals("shell-content", File(root, "bin/sh").readText())
         assertTrue(File(root, "bin").canonicalFile.toPath().startsWith(root.canonicalFile.toPath()))
         assertEquals(File(root, "usr/bin").canonicalPath, File(root, "usr/bin/self").canonicalPath)
+    }
+
+    @Test fun skipsGuestDevicesRegardlessOfWrapperAndEntryOrder() = fixture { directory ->
+        for (prefix in listOf("", "ubuntu-noble-aarch64/")) {
+            val image = archive(directory, listOf(
+                special("${prefix}dev/console", TarConstants.LF_CHR),
+                special("${prefix}dev/loop0", TarConstants.LF_BLK),
+                special("${prefix}dev/pipe", TarConstants.LF_FIFO),
+                TarArchiveEntry("${prefix}dev/regular") to "keep",
+                TarArchiveEntry("${prefix}etc/os-release") to "ID=ubuntu",
+                TarArchiveEntry("${prefix}usr/bin/sh") to "shell-content",
+                link("${prefix}bin", "/usr/bin"),
+            ))
+            val root = File(directory, "root-${prefix.isNotEmpty()}")
+            RootfsArchives.extract(image, root)
+            assertEquals("ID=ubuntu", File(root, "etc/os-release").readText())
+            assertEquals("shell-content", File(root, "bin/sh").readText())
+            assertEquals(listOf("regular"), File(root, "dev").list()!!.toList())
+        }
+    }
+
+    @Test fun rejectsDevicesOutsideActualGuestDev() = fixture { directory ->
+        val entries = listOf(
+            listOf(TarArchiveEntry("etc/") to "", special("opt/dev/console", TarConstants.LF_CHR)),
+            listOf(TarArchiveEntry("wrapped/etc/") to "", special("wrapped/devices/console", TarConstants.LF_CHR)),
+            listOf(TarArchiveEntry("etc/") to "", TarArchiveEntry("wrapped/etc/") to "", special("wrapped/dev/console", TarConstants.LF_CHR)),
+            listOf(TarArchiveEntry("wrapped/etc/") to "", special("wrapped/dev", TarConstants.LF_FIFO)),
+        )
+        entries.forEachIndexed { index, members ->
+            assertFailsWith<IllegalStateException> {
+                RootfsArchives.extract(archive(directory, members), File(directory, "root$index"))
+            }
+        }
+    }
+
+    @Test fun skippedDeviceCannotShareAnArchivePathWithAFileOrLink() = fixture { directory ->
+        val name = "wrapped/dev/console"
+        val device = special(name, TarConstants.LF_CHR)
+        val conflicts = listOf(TarArchiveEntry(name) to "bad", link(name, "regular"))
+        conflicts.forEachIndexed { index, conflict ->
+            val image = archive(directory, listOf(TarArchiveEntry("wrapped/etc/") to "", device, conflict))
+            assertFailsWith<IllegalArgumentException> { RootfsArchives.extract(image, File(directory, "root$index")) }
+        }
     }
 
     @Test fun refusesExportThroughDirectorySymlinkIntoRootfs() = fixture { directory ->
