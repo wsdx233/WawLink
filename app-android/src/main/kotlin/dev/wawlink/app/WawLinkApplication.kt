@@ -24,6 +24,7 @@ class WawLinkApplication : Application() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var containerService: ContainerForegroundService? = null
+    private var retryContainerServiceOnResume = false
     private var containerServiceStartPending = false
     override fun onCreate() {
         super.onCreate()
@@ -52,6 +53,7 @@ class WawLinkApplication : Application() {
             // AppCoordinator.active already includes Android keep-alive demand.
             coordinator.active.collect { needed ->
                 if (needed) startContainerServiceIfNeeded()
+                else retryContainerServiceOnResume = false
             }
         }
     }
@@ -70,10 +72,18 @@ class WawLinkApplication : Application() {
         }
     }
 
+    internal fun onHostResumed() {
+        if (!retryContainerServiceOnResume) return
+        mainHandler.post {
+            if (retryContainerServiceOnResume) startContainerServiceIfNeeded()
+        }
+    }
+
     private fun wantsContainerService(): Boolean = coordinator.active.value || coordinator.keepAlive.value.enabled
 
     private fun startContainerServiceIfNeeded() {
         if (!wantsContainerService() || containerServiceStartPending || containerService != null) return
+        retryContainerServiceOnResume = false
         containerServiceStartPending = true
         try {
             ContainerForegroundService.validateStartConfiguration(this)
@@ -82,6 +92,9 @@ class WawLinkApplication : Application() {
             }
         } catch (error: Exception) {
             containerServiceStartPending = false
+            // Only the background-start restriction can be relieved by resuming the Activity.
+            retryContainerServiceOnResume = android.os.Build.VERSION.SDK_INT >= 31 &&
+                error is android.app.ForegroundServiceStartNotAllowedException
             coordinator.showError(error)
             coordinator.updateKeepAliveStatus {
                 it.copy(serviceRunning = false, wakeLockHeld = false, wifiLockHeld = false, silentAudioPlaying = false,

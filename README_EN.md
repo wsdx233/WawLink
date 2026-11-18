@@ -113,7 +113,9 @@ When setup is ready, select **Start Session** and send your first request. If yo
 Rootfs path construction uses `Paths.get(...)`, available since Android 8.0 / API 26, rather than `Path.of(...)`, which requires Android 14. Mount and link boundary checks remain in place.
 
 Switching between PRoot/Proroot and chroot from container details first explains physical ownership conversion and its potentially long duration. Starting conversion stops the container, checks and converts ownership, then saves the engine. Deferring saves the target engine while retaining physical ownership; later starts do not silently perform the conversion. The target engine may fail to start or access files until you explicitly resume conversion from container details. Dismissing the dialog leaves the configuration unchanged. An unfinished migration cannot be bypassed by deferring.
-Toolchain install/remove and apt cache cleanup first run `dpkg --configure -a` in noninteractive mode to finish an interrupted transaction. If repair fails, the original error is preserved and apt is not started.
+OMP installation, toolchain changes, and package-cache cleanup are mutually exclusive per container. They require guest root and never elevate privileges automatically. On Debian, Ubuntu, and Kali, package operations first run `dpkg --configure -a` noninteractively. If repair or a repository update fails, installation does not continue and the original error is preserved. Missing CA certificates are bootstrapped with temporary sources that retain signature verification; configured sources are not changed.
+
+OMP installation runs in a dedicated terminal. Rotating the screen does not restart it; navigating back asks before cancelling. A successful script exit immediately triggers a native-module and RPC health check, without closing the terminal. A confirmed missing or damaged installation can offer repair; ordinary RPC timeouts, permission errors, and container stops do not.
 
 ### Android chroot Host Root Access
 

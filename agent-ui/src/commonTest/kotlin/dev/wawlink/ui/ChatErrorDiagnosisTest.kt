@@ -6,14 +6,16 @@ import kotlin.test.assertTrue
 
 class ChatErrorDiagnosisTest {
     @Test fun identifiesOmpFailuresWithoutConfusingUnrelatedMissingFiles() {
-        val errors = listOf(
-            "容器中的 OMP 缺失", "OMP 安装损坏", "OMP 输出流已关闭", "OMP 通信响应损坏",
-            "OMP 进程未启动", "Cannot find module 'native'", "ENOENT: /opt/omp/bin/omp",
-        )
+        val errors = listOf("容器中的 OMP 缺失", "OMP 安装损坏", "容器中的 OMP 缺失或安装损坏")
         for (error in errors) {
             assertEquals(listOf(ChatErrorAction.OPEN_OMP_REPAIR), diagnoseChatError(error, "selected"), error)
         }
         assertTrue(diagnoseChatError("ENOENT: /workspace/note.txt", "selected").isEmpty())
+        for (error in listOf("OMP 输出流已关闭", "OMP 通信响应损坏", "OMP 进程未启动", "OMP 进程异常",
+            "OMP 请求超时：get_state", "OMP 本地日志保存失败", "Cannot find module 'native'",
+            "Cannot find module 'omp'", "ENOENT: /opt/omp/bin/omp", "插件安装损坏")) {
+            assertTrue(diagnoseChatError(error, "selected").isEmpty(), error)
+        }
     }
 
     @Test fun identifiesProviderAuthenticationAndModelFailures() {
@@ -40,11 +42,11 @@ class ChatErrorDiagnosisTest {
 
     @Test fun explicitFailuresTakePriorityAndRepairRequiresHostCallback() {
         assertEquals(listOf(ChatErrorAction.OPEN_OMP_REPAIR, ChatErrorAction.OPEN_PROVIDER_SETTINGS),
-            diagnoseChatError("Cannot find module 'omp'", ""))
+            diagnoseChatError("容器中的 OMP 缺失或安装损坏", ""))
         assertEquals(listOf(ChatErrorAction.OPEN_PROVIDER_SETTINGS, ChatErrorAction.OPEN_AGENT_SETTINGS),
-            visibleChatErrorActions("Cannot find module 'omp'", "", canRepairOmp = false))
+            visibleChatErrorActions("容器中的 OMP 缺失或安装损坏", "", canRepairOmp = false))
         assertEquals(listOf(ChatErrorAction.OPEN_OMP_REPAIR, ChatErrorAction.OPEN_PROVIDER_SETTINGS),
-            visibleChatErrorActions("Cannot find module 'omp'", "", canRepairOmp = true))
+            visibleChatErrorActions("容器中的 OMP 缺失或安装损坏", "", canRepairOmp = true))
         assertTrue(visibleChatErrorActions("OMP 进程未启动", "selected", canRepairOmp = false).isEmpty())
     }
 

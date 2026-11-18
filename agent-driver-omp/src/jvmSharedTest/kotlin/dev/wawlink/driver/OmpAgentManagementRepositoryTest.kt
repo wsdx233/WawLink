@@ -26,6 +26,69 @@ import kotlinx.coroutines.flow.first
 import kotlinx.serialization.json.*
 
 class OmpAgentManagementRepositoryTest {
+    @Test fun ordinaryRpcTimeoutKeepsTheNativeProcessAndDoesNotReplayTheOperation() = runBlocking {
+        fixture {
+            val transport = connect()
+            transport.respond(transport.request("snapshot"), configuration)
+            transport.respond(transport.request("modelsSnapshot"), catalogueResult)
+            awaitState { !it.modelsLoading }
+            repository.rpcTiming = OmpRpcTiming(requestMs = 80, probeMs = 300)
+            val operation = async { runCatching { repository.resources.request("skills.snapshot", emptyMap()) } }
+            transport.request("skills.snapshot")
+            assertTrue(withTimeout(5_000) { operation.await() }.exceptionOrNull() is OmpRpcTimeoutException)
+            assertTrue(transport.isAlive)
+            transport.respond(transport.request("ping"), JsonPrimitive(true))
+            val retry = async { repository.resources.request("skills.snapshot", emptyMap()) }
+            transport.respond(transport.request("skills.snapshot"), buildJsonObject { put("actual", true) })
+            assertEquals(true, retry.await()["actual"])
+            assertTrue(transport.isAlive)
+            assertEquals("review", repository.state.value.agents.single().name)
+            assertTrue(runtimeFailures.isEmpty())
+            assertTrue(uncaught.isEmpty(), uncaught.toString())
+        }
+    }
+
+    @Test fun unresponsiveManagementRequiresThreeBoundedProbesAndKeepsDefinitions() = runBlocking {
+        fixture {
+            val transport = connect()
+            transport.respond(transport.request("snapshot"), configuration)
+            transport.respond(transport.request("modelsSnapshot"), catalogueResult)
+            awaitState { !it.modelsLoading }
+            repository.rpcTiming = OmpRpcTiming(requestMs = 80, probeMs = 150)
+            val operation = async { runCatching { repository.resources.request("skills.snapshot", emptyMap()) } }
+            transport.request("skills.snapshot")
+            assertTrue(operation.await().exceptionOrNull() is OmpRpcTimeoutException)
+            repeat(3) {
+                transport.request("ping")
+                assertTrue(transport.isAlive)
+            }
+            val failed = awaitState { it.error?.contains("连续 3 次") == true }
+            withTimeout(5_000) { transport.destroyed.await() }
+            assertEquals("review", failed.agents.single().name)
+            assertTrue(runtimeFailures.isEmpty())
+            assertTrue(uncaught.isEmpty(), uncaught.toString())
+        }
+    }
+
+    @Test fun hostStorageFailureReturnsItsCodeWithoutLeakingTheConfigurationBody() = runBlocking {
+        fixture {
+            val transport = connect()
+            transport.respond(transport.request("snapshot"), configuration)
+            transport.respond(transport.request("modelsSnapshot"), catalogueResult)
+            awaitState { !it.modelsLoading }
+            file("blocked").writeText("not a directory")
+            transport.host("atomicWrite", buildJsonObject {
+                put("path", "$guestAgentDir/blocked/models.yml")
+                put("content", "apiKey: sk-private-storage-secret")
+            })
+            val message = transport.hostResponse()["error"]!!.jsonPrimitive.content
+            assertTrue(message.contains("Native configuration storage failed"), message)
+            assertTrue(message.contains("$guestAgentDir/blocked"), message)
+            assertFalse(message.contains("sk-private-storage-secret"))
+            assertTrue(transport.isAlive)
+            assertTrue(runtimeFailures.isEmpty())
+        }
+    }
     @Test fun configurationIsUsableBeforeModelsAndInvalidModelsRemainRecoverable() = runBlocking {
         fixture {
             val transport = connect()
@@ -63,7 +126,7 @@ class OmpAgentManagementRepositoryTest {
             first.destroy()
             val failed = awaitState { !it.loading && !it.modelsLoading && it.error != null }
             assertEquals("review", failed.agents.single().name)
-            assertEquals(1, runtimeFailures.size)
+            assertTrue(runtimeFailures.isEmpty())
             val reload = async { repository.reload() }
             val replacement = connect()
             replacement.respond(replacement.request("snapshot"), configuration)
@@ -72,7 +135,7 @@ class OmpAgentManagementRepositoryTest {
             assertNull(repository.state.value.error)
             assertNull(repository.state.value.modelsError)
             assertEquals("local/chat", repository.state.value.roles.single().model)
-            assertEquals(1, runtimeFailures.size)
+            assertTrue(runtimeFailures.isEmpty())
             assertTrue(uncaught.isEmpty(), uncaught.toString())
         }
     }
@@ -175,7 +238,7 @@ class OmpAgentManagementRepositoryTest {
             assertTrue(incomplete.modelsError!!.contains("传输不完整"))
             assertEquals("local/chat", incomplete.models.single().key)
             assertEquals("review", incomplete.agents.single().name)
-            assertEquals(1, runtimeFailures.size)
+            assertTrue(runtimeFailures.isEmpty())
             assertTrue(uncaught.isEmpty(), uncaught.toString())
         }
     }
@@ -262,20 +325,22 @@ class OmpAgentManagementRepositoryTest {
         }
     }
 
-    @Test fun nativeExitBeforeInitReportsOnceAndReloadCanRecover() = runBlocking {
+    @Test fun nativeExitBeforeInitConfirmsInstallationFaultAndReloadCanRecover() = runBlocking {
         fixture {
+            installationState = "BROKEN"
             val first = launchTransport()
             first.request("init")
             first.destroy()
             awaitState { !it.loading && it.error != null }
-            assertEquals(1, runtimeFailures.size)
+            withTimeout(5_000) { runtimeFailureReported.await() }
+            assertEquals(listOf(0L), failureGenerations.toList())
             val reload = async { repository.reload() }
             val replacement = connect()
             replacement.respond(replacement.request("snapshot"), configuration)
             replacement.respond(replacement.request("modelsSnapshot"), catalogueResult)
             reload.await()
             assertNull(repository.state.value.error)
-            assertEquals(1, runtimeFailures.size)
+            assertEquals(listOf(0L), failureGenerations.toList())
         }
     }
 
@@ -287,8 +352,7 @@ class OmpAgentManagementRepositoryTest {
             transport.emitRaw("not-json sk-secret-provider-body")
             val failed = awaitState { !it.modelsLoading && it.error != null }
             assertEquals("review", failed.agents.single().name)
-            assertEquals(1, runtimeFailures.size)
-            assertFalse(runtimeFailures.single().contains("sk-secret"))
+            assertTrue(runtimeFailures.isEmpty())
             assertFalse(failed.error!!.contains("sk-secret"))
         }
     }
@@ -301,7 +365,7 @@ class OmpAgentManagementRepositoryTest {
             awaitState { !it.modelsLoading }
             transport.failWrites = true
             assertTrue(runCatching { repository.generateAgent("描述") }.isFailure)
-            assertEquals(1, runtimeFailures.size)
+            assertTrue(runtimeFailures.isEmpty())
             assertEquals("review", repository.state.value.agents.single().name)
             val reload = async { repository.reload() }
             val replacement = connect()
@@ -309,7 +373,7 @@ class OmpAgentManagementRepositoryTest {
             replacement.respond(replacement.request("modelsSnapshot"), catalogueResult)
             reload.await()
             assertEquals("chat", repository.state.value.models.single().id)
-            assertEquals(1, runtimeFailures.size)
+            assertTrue(runtimeFailures.isEmpty())
         }
     }
 
@@ -390,8 +454,8 @@ class OmpAgentManagementRepositoryTest {
             assertNull(repository.state.value.error)
             replacement.destroy()
             awaitState { it.error != null }
-            assertEquals(1, runtimeFailures.size)
-            assertEquals(listOf(1L), failureGenerations)
+            assertTrue(runtimeFailures.isEmpty())
+            assertTrue(failureGenerations.isEmpty())
             assertTrue(uncaught.isEmpty(), uncaught.toString())
         }
     }
@@ -640,10 +704,15 @@ class OmpAgentManagementRepositoryTest {
         val failureGenerations = CopyOnWriteArrayList<Long>()
         val uncaught = CopyOnWriteArrayList<Throwable>()
         val runtimeFailures = CopyOnWriteArrayList<String>()
+        val runtimeFailureReported = CompletableDeferred<Unit>()
+        @Volatile var installationState = "READY"
         private val owner = CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, failure -> uncaught += failure })
         private val runtime = object : ContainerRuntime by local {
             override val containers = containerState
             override suspend fun openProcess(id: String, arguments: List<String>, cwd: String, environment: Map<String, String>): Process {
+                if (arguments.lastOrNull() == "--inspect") {
+                    return ProcessBuilder("/bin/sh", "-c", "printf 'WAWLINK_OMP_CHECK\\t%s\\tfixture\\n' \"\$1\"", "fixture", installationState).start()
+                }
                 OmpGuestFilesFixture.launch(arguments, rootfs, environment)?.let { return it }
                 launches += arguments
                 opening.send(Unit)
@@ -656,7 +725,11 @@ class OmpAgentManagementRepositoryTest {
         val repository = OmpAgentManagementRepository(
             runtime, AgentConfigurationContext("fixture", "验证", projectPath = projectPath),
             guestFiles, { guestAgentDir },
-            owner, { _, _ -> }, { _, _ -> }, { emptyMap() }, {}, { generation, message -> failureGenerations += generation; runtimeFailures += message },
+            owner, { _, _ -> }, { _, _ -> }, { emptyMap() }, {}, { generation, message ->
+                failureGenerations += generation
+                runtimeFailures += message
+                runtimeFailureReported.complete(Unit)
+            },
             loadInitially = loadInitially,
         )
         fun stopContainer() {

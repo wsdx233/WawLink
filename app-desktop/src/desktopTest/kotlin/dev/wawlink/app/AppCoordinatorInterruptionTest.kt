@@ -6,20 +6,28 @@ import dev.wawlink.runtime.ContainerInfo
 import dev.wawlink.runtime.ContainerRuntime
 import dev.wawlink.runtime.LocalContainerRuntime
 import dev.wawlink.runtime.RuntimePaths
+import dev.wawlink.runtime.TerminalSession
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class AppCoordinatorInterruptionTest {
@@ -88,12 +96,14 @@ class AppCoordinatorInterruptionTest {
         }
     }
 
-    private class Fixture(private val waitForInput: Boolean = false) : AutoCloseable {
+    private class Fixture(private val waitForInput: Boolean = false, private val installerExit: Int = 0) : AutoCloseable {
         private val directory = Files.createTempDirectory("wawlink-interruption-").toFile()
         private val base = LocalContainerRuntime(RuntimePaths(directory.resolve("runtime")))
         val containers = MutableStateFlow(listOf(ContainerInfo(ContainerConfig("guest", "测试容器", directory.resolve("root").path))))
         val probes = AtomicInteger()
         val opened = Channel<Process>(Channel.UNLIMITED)
+        val packageOpened = Channel<Process>(Channel.UNLIMITED)
+        val attachPackage = CompletableDeferred<Unit>()
         private val children = mutableListOf<Process>()
         private val runtime = object : ContainerRuntime by base {
             override val containers = this@Fixture.containers
@@ -103,10 +113,41 @@ class AppCoordinatorInterruptionTest {
                 val script = (if (waitForInput) "read release; " else "") + "printf 'WAWLINK_OMP_CHECK\\tMISSING\\tOMP is missing\\n'"
                 return ProcessBuilder("/bin/sh", "-c", script).start().also { synchronized(children) { children += it }; opened.send(it) }
             }
+            override suspend fun openRunningProcess(id: String, arguments: List<String>, cwd: String, environment: Map<String, String>): Process {
+                if (arguments.lastOrNull() != "--inspect") return base.openRunningProcess(id, arguments, cwd, environment)
+                probes.incrementAndGet()
+                return spawn("printf 'WAWLINK_OMP_CHECK\\tREADY\\thealthy\\n'")
+            }
+            override suspend fun openPackageTerminal(id: String, stopGeneration: Long, command: String, beforeStart: suspend () -> Unit): TerminalSession {
+                beforeStart()
+                containers.value = containers.value.map { it.copy(running = true, runGeneration = 1) }
+                val child = spawn("read gate; exit $installerExit")
+                packageOpened.send(child)
+                attachPackage.await()
+                return object : TerminalSession {
+                    override val process = child
+                    override val processId = child.pid()
+                    override val isAlive = MutableStateFlow(true)
+                    override val runGeneration = 1L
+                    override suspend fun awaitExit() = runInterruptible(Dispatchers.IO) { process.waitFor() }.also { isAlive.value = false }
+                    override fun resize(columns: Int, rows: Int, cellWidthPixels: Int, cellHeightPixels: Int) = Unit
+                    override fun close() { if (process.isAlive) process.destroyForcibly() }
+                }
+            }
+            override suspend fun closeProcess(id: String, process: Process) {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    if (process.isAlive) process.destroyForcibly()
+                    process.waitFor()
+                }
+            }
+        }
+        private fun spawn(script: String): Process = ProcessBuilder("/bin/sh", "-c", script).start().also {
+            synchronized(children) { children += it }
         }
         val app = AppCoordinator(runtime, OmpProcessPool(runtime, directory.resolve("pool")), directory.resolve("app"))
         fun interrupt() { containers.value = containers.value.map { it.copy(stopGeneration = it.stopGeneration + 1) } }
         override fun close() {
+            attachPackage.complete(Unit)
             app.close()
             synchronized(children) { children.forEach { it.destroyForcibly(); it.waitFor() } }
             directory.deleteRecursively()
@@ -152,6 +193,30 @@ class AppCoordinatorInterruptionTest {
             assertFailsWith<CancellationException> { fixture.app.openTerminal("guest", approval) }
             assertEquals(0, fixture.probes.get())
             assertNull(fixture.app.notice.value)
+        }
+    }
+
+    @Test fun closingAViewDoesNotCancelAuthorizedInstallerAndOnlySuccessRunsPostCheck() = runBlocking {
+        for (exit in listOf(23, 0)) Fixture(installerExit = exit).use { fixture ->
+            withTimeout(5_000) {
+                val app = fixture.app
+                app.requestOmpInstallation("guest")
+                val approval = requireNotNull(app.confirmOmpSetup(app.ompSetup.first { it != null }!!))
+                val outcome = requireNotNull(app.ompInstallationOutcome("guest", approval))
+                val detachedView = async { app.openTerminal("guest", approval) }
+                val process = fixture.packageOpened.receive()
+                detachedView.cancelAndJoin()
+                assertTrue(process.isAlive)
+                assertNull(outcome.value)
+                fixture.attachPackage.complete(Unit)
+                val reattached = app.openTerminal("guest", approval)
+                assertSame(process, reattached.process)
+                reattached.process.outputStream.apply { write("finish\n".toByteArray()); flush() }
+                assertEquals(exit != 0, outcome.first { it != null }!!.failed)
+                assertEquals(if (exit == 0) 1 else 0, fixture.probes.get())
+                app.finishOmpInstallation("guest", approval)
+                assertNull(app.ompInstallationOutcome("guest", approval))
+            }
         }
     }
 }

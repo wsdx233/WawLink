@@ -30,20 +30,68 @@ import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import dev.wawlink.runtime.TerminalSession
+import java.lang.ref.WeakReference
+import java.util.WeakHashMap
+
+// Main-thread only. An install keeps one PTY reader and scrollback across Activity/view reconstruction.
+private val installerEmulators = WeakHashMap<TerminalSession, InstallerEmulator>()
+
+private class InstallerEmulator(transport: TerminalSession) {
+    private val target = WeakReference(transport)
+    private var attached: TerminalSessionClient? = null
+    private val emulator = EmulatorSession(transport.process, transport.processId.toInt(), { columns, rows, width, height ->
+        target.get()?.resize(columns, rows, width, height)
+    }, 10_000, DetachedTerminalClient)
+
+    fun attach(client: TerminalSessionClient): EmulatorSession = emulator.also {
+        attached = client
+        it.updateTerminalSessionClient(client)
+    }
+
+    fun detach(client: TerminalSessionClient) {
+        if (attached !== client) return
+        attached = null
+        emulator.updateTerminalSessionClient(DetachedTerminalClient)
+    }
+}
+
+private object DetachedTerminalClient : TerminalSessionClient {
+    override fun onTextChanged(changedSession: EmulatorSession) = Unit
+    override fun onTitleChanged(changedSession: EmulatorSession) = Unit
+    override fun onSessionFinished(finishedSession: EmulatorSession) = Unit
+    override fun onCopyTextToClipboard(session: EmulatorSession, text: String?) = Unit
+    override fun onPasteTextFromClipboard(session: EmulatorSession?) = Unit
+    override fun onBell(session: EmulatorSession) = Unit
+    override fun onColorsChanged(session: EmulatorSession) = Unit
+    override fun onTerminalCursorStateChange(state: Boolean) = Unit
+    override fun setTerminalShellPid(session: EmulatorSession, pid: Int) = Unit
+    override fun getTerminalCursorStyle(): Int = 0
+    override fun logError(tag: String?, message: String?) { Log.e(tag ?: "Terminal", message.orEmpty()) }
+    override fun logWarn(tag: String?, message: String?) { Log.w(tag ?: "Terminal", message.orEmpty()) }
+    override fun logInfo(tag: String?, message: String?) { Log.i(tag ?: "Terminal", message.orEmpty()) }
+    override fun logDebug(tag: String?, message: String?) { Log.d(tag ?: "Terminal", message.orEmpty()) }
+    override fun logVerbose(tag: String?, message: String?) { Log.v(tag ?: "Terminal", message.orEmpty()) }
+    override fun logStackTraceWithMessage(tag: String?, message: String?, error: Exception?) { Log.e(tag ?: "Terminal", message.orEmpty(), error) }
+    override fun logStackTrace(tag: String?, error: Exception?) { Log.e(tag ?: "Terminal", "终端错误", error) }
+}
 
 /** Love2Droid's pinned terminal host/key layout, using WawLink's runtime-owned PTY. */
 @Composable
-internal fun TerminalSurface(session: TerminalSession, modifier: Modifier) {
+internal fun TerminalSurface(session: TerminalSession, modifier: Modifier, retainOnDetach: Boolean) {
     val context = LocalContext.current
     val density = LocalDensity.current
-    val controller = remember(session, context) { AndroidTerminalController(context, session, density) }
+    val controller = remember(session, context, retainOnDetach) {
+        val retained = if (retainOnDetach) installerEmulators.getOrPut(session) { InstallerEmulator(session) } else null
+        AndroidTerminalController(context, session, density, retained)
+    }
     val alive by session.isAlive.collectAsState()
     val orientation = LocalConfiguration.current.orientation
     DisposableEffect(controller) { onDispose { controller.detach() } }
     AndroidView(factory = { controller.host }, modifier = modifier, update = { controller.updateKeys(alive, orientation, density) })
 }
 
-private class AndroidTerminalController(context: Context, private val transport: TerminalSession, initialDensity: Density) : TerminalSessionClient, TerminalViewClient {
+private class AndroidTerminalController(context: Context, private val transport: TerminalSession, initialDensity: Density,
+    private val retained: InstallerEmulator?) : TerminalSessionClient by DetachedTerminalClient, TerminalViewClient {
     private var ctrl = false
     private var alt = false
     private var disposed = false
@@ -60,7 +108,7 @@ private class AndroidTerminalController(context: Context, private val transport:
     val host = LinearLayout(context)
     private val keyBar = LinearLayout(context)
     private val keySpacer = View(context)
-    private val emulator = EmulatorSession(transport.process, transport.processId.toInt(), transport::resize, 10_000, this)
+    private val emulator = retained?.attach(this) ?: EmulatorSession(transport.process, transport.processId.toInt(), transport::resize, 10_000, this)
     private val windowFocusListener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { focused ->
         if (focused) view.post { connectInput() } else view.setTerminalCursorBlinkerState(false, false)
     }
@@ -198,7 +246,7 @@ private class AndroidTerminalController(context: Context, private val transport:
         view.stopTextSelectionMode()
         view.setTerminalCursorBlinkerState(false, false)
         input.hideSoftInputFromWindow(view.windowToken, 0)
-        transport.close()
+        if (retained == null) transport.close() else retained.detach(this)
     }
     override fun onTextChanged(changedSession: EmulatorSession) { if (!disposed) view.onScreenUpdated() }
     override fun onTitleChanged(changedSession: EmulatorSession) = Unit
@@ -230,13 +278,6 @@ private class AndroidTerminalController(context: Context, private val transport:
     override fun readFnKey() = false
     override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: EmulatorSession?) = false
     override fun onEmulatorSet() { if (!disposed) view.setTerminalCursorBlinkerState(true, true) }
-    override fun logError(tag: String?, message: String?) { Log.e(tag ?: "Terminal", message.orEmpty()) }
-    override fun logWarn(tag: String?, message: String?) { Log.w(tag ?: "Terminal", message.orEmpty()) }
-    override fun logInfo(tag: String?, message: String?) { Log.i(tag ?: "Terminal", message.orEmpty()) }
-    override fun logDebug(tag: String?, message: String?) { Log.d(tag ?: "Terminal", message.orEmpty()) }
-    override fun logVerbose(tag: String?, message: String?) { Log.v(tag ?: "Terminal", message.orEmpty()) }
-    override fun logStackTraceWithMessage(tag: String?, message: String?, error: Exception?) { Log.e(tag ?: "Terminal", message.orEmpty(), error) }
-    override fun logStackTrace(tag: String?, error: Exception?) { Log.e(tag ?: "Terminal", "终端错误", error) }
 
     private data class TerminalKey(val label: String, val sequence: String = "", val modifier: Int? = null)
     private companion object {

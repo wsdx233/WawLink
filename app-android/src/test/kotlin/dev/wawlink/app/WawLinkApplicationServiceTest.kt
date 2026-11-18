@@ -211,6 +211,8 @@ class WawLinkApplicationServiceTest {
         assertTrue(status.error.orEmpty().contains(Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
         assertErrorNoticeContains(Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE)
         repeat(3) { dispatchMain() }
+        application.onHostResumed()
+        dispatchMain()
         assertEquals(0, RefusingServiceContext.startAttempts)
 
         shadowOf(application).grantPermissions(Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE)
@@ -234,6 +236,20 @@ class WawLinkApplicationServiceTest {
 
         demand(false)
         demand(true)
+        assertEquals(2, RefusingServiceContext.startAttempts)
+        assertEquals(1, shadowOf(application).allStartedServices.size)
+        assertNoStopRequests()
+    }
+
+    @Test fun backgroundStartRefusalRetriesOnceWhenHostResumesWithoutNewDemand() {
+        RefusingServiceContext.nextFailure = android.app.ForegroundServiceStartNotAllowedException("background restricted")
+        demand(true)
+        assertEquals(1, RefusingServiceContext.startAttempts)
+        dispatchMain()
+        assertEquals(1, RefusingServiceContext.startAttempts)
+
+        repeat(2) { application.onHostResumed() }
+        dispatchMain()
         assertEquals(2, RefusingServiceContext.startAttempts)
         assertEquals(1, shadowOf(application).allStartedServices.size)
         assertNoStopRequests()

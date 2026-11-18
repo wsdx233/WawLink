@@ -2,6 +2,7 @@ package dev.wawlink.runtime
 
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -30,22 +31,16 @@ import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-/** Script and shell are positional parameters, never interpolated into shell source or pasted into the PTY. */
-internal fun terminalArguments(shell: String, initialCommand: String?): List<String> {
-    if (initialCommand == null) return listOf(shell, "-i")
-    require('\u0000' !in initialCommand) { "终端初始命令不能包含 NUL" }
-    return listOf("/bin/sh", "-c", """
-        trap ':' INT
-        /bin/sh -c "${'$'}1"
-        status=${'$'}?
-        trap - INT
-        if [ "${'$'}status" -ne 0 ]; then printf '\n初始命令失败（退出码 %s）；终端保持打开。\n' "${'$'}status"; fi
-        exec "${'$'}2" -i
-    """.trimIndent(), "wawlink-terminal", initialCommand, shell)
+/** Use a dedicated command PTY so the real installer status is never replaced by an interactive shell. */
+internal fun terminalArguments(shell: String, packageCommand: String?): List<String> {
+    if (packageCommand == null) return listOf(shell, "-i")
+    require(packageCommand.isNotBlank() && '\u0000' !in packageCommand) { "终端命令无效" }
+    return listOf("/bin/sh", "-c", packageCommand)
 }
 
 @Serializable
@@ -106,6 +101,8 @@ class LocalContainerRuntime internal constructor(
     private val distroDeployments = mutableMapOf<String, DistroDeployment>()
     private val idleJobs = mutableMapOf<String, Job>()
     private val packageLocks = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+    // Guarded by the runtime mutex. A terminal hands off its lease until the tracked process tree is reaped.
+    private val packageTerminalLeases = mutableMapOf<TrackedProcess, Mutex>()
     private var debugRootfsRemoved = false
     @Volatile private var closing = false
     @Volatile private var closed = false
@@ -406,6 +403,7 @@ class LocalContainerRuntime internal constructor(
         }
         owned.forEach { it.terminal?.close() }
         check(owned.none { it.hasLiveProcesses() }) { "容器仍有已跟踪进程未退出，已保留挂载以保护文件系统" }
+        owned.forEach { packageTerminalLeases.remove(it)?.unlock() }
         try { engines.unmount(id); errors.remove(id) }
         catch (failure: Throwable) { errors[id] = failure.message.orEmpty(); publish(); throw failure }
         processes.remove(id)
@@ -1135,10 +1133,7 @@ class LocalContainerRuntime internal constructor(
             check(!tracked.hasLiveProcesses()) { "容器命令仍有已跟踪子进程未退出，已保留进程身份供重试" }
             mutex.withLock {
                 // Stop/delete may already have removed this record. Never touch a newer run.
-                processes[id]?.let { records ->
-                    records.remove(tracked)
-                    if (records.isEmpty()) processes.remove(id)
-                }
+                reapLocked(id, tracked)
             }
         }
     }
@@ -1219,15 +1214,7 @@ class LocalContainerRuntime internal constructor(
                     catch (failure: Throwable) { errors[config.id] = "$reason；${failure.message}" }
                     publish()
                 } else {
-                    processes[config.id]?.remove(tracked)
-                    if (!keeper && configurations[config.id]?.autoSleep == true && processes[config.id].orEmpty().none { !it.keeper }) {
-                        val stopGeneration = stopGenerations[config.id]
-                        val keeperAtSchedule = keepers[config.id]
-                        idleJobs[config.id] = scope.launch {
-                            delay(30_000)
-                            mutex.withLock { stopIdleLocked(config.id, stopGeneration, keeperAtSchedule) }
-                        }
-                    }
+                    reapLocked(config.id, tracked)
                 }
             }
         }
@@ -1243,6 +1230,23 @@ class LocalContainerRuntime internal constructor(
             } finally { pidFile.delete() }
         }
         return tracked
+    }
+
+    private fun reapLocked(id: String, tracked: TrackedProcess) {
+        val records = processes[id] ?: return
+        if (!records.remove(tracked)) return
+        packageTerminalLeases.remove(tracked)?.unlock()
+        if (records.isEmpty()) processes.remove(id)
+        val keeper = keepers[id] ?: return
+        if (!closed && !closing && !keeper.stopping && keeper.isAlive && !tracked.keeper &&
+            configurations[id]?.autoSleep == true && records.none { !it.keeper }) {
+            val generation = stopGenerations[id]
+            idleJobs.remove(id)?.cancel()
+            idleJobs[id] = scope.launch {
+                delay(30_000)
+                mutex.withLock { stopIdleLocked(id, generation, keeper) }
+            }
+        }
     }
 
     override suspend fun execute(id: String, command: String, cwd: String): String {
@@ -1269,85 +1273,142 @@ class LocalContainerRuntime internal constructor(
         } finally { if (process.isAlive) process.destroy() }
     }
 
-    override suspend fun openTerminal(id: String, initialCommand: String?): TerminalSession {
-        val generation = containers.value.firstOrNull { it.config.id == id }?.stopGeneration
-        return withContext(Dispatchers.IO) { mutex.withLock {
-            currentCoroutineContext().ensureActive()
-            if (generation != null && wasInterrupted(id, generation)) throw CancellationException("容器已停止或重新启动")
-            ensureOpen(); startLocked(id); idleJobs.remove(id)?.cancel()
-            val config = config(id)
-            val tracked = launchLocked(config, terminalArguments(config.shell, initialCommand), "/workspace", emptyMap(), true, false, pty = true)
-            object : TerminalSession {
-                override val process = tracked.process
-                override val processId = requireNotNull(tracked.pid)
-                private val alive = MutableStateFlow(process.isAlive)
-                override val isAlive = alive.asStateFlow()
-                private val closing = java.util.concurrent.atomic.AtomicBoolean()
-                init { scope.launch { process.waitFor(); alive.value = false } }
-                override fun resize(columns: Int, rows: Int, cellWidthPixels: Int, cellHeightPixels: Int) {
-                    require(columns > 0 && rows > 0)
-                    if (!closing.get() && !tracked.stopping && process.isAlive) {
-                        try { requireNotNull(tracked.terminal).resize(columns, rows, cellWidthPixels, cellHeightPixels) }
-                        catch (failure: Exception) { if (!closing.get() && !tracked.stopping) throw failure }
+    override suspend fun openTerminal(id: String): TerminalSession =
+        openTrackedTerminal(id, containerStopGeneration(id), null)
+
+    override suspend fun openPackageTerminal(id: String, stopGeneration: Long, command: String, beforeStart: suspend () -> Unit): TerminalSession {
+        val lease = acquirePackageLock(id)
+        var handedOff = false
+        try {
+            withContext(Dispatchers.IO) { mutex.withLock {
+                ensurePackageTerminalAvailable(id, stopGeneration)
+                engines.requireGuestPackageRoot(config(id))
+            } }
+            beforeStart()
+            return openTrackedTerminal(id, stopGeneration, command) { tracked ->
+                packageTerminalLeases[tracked] = lease
+                handedOff = true
+            }
+        } finally {
+            if (!handedOff) lease.unlock()
+        }
+    }
+
+    private fun containerStopGeneration(id: String): Long = containers.value.firstOrNull { it.config.id == id }?.stopGeneration
+        ?: throw CancellationException("容器已移除")
+
+    private fun acquirePackageLock(id: String): Mutex = packageLocks.getOrPut(id) { Mutex() }.also {
+        check(it.tryLock()) { "此容器正在执行安装、卸载或清理缓存，请等待当前包操作结束" }
+    }
+
+    private fun ensurePackageTerminalAvailable(id: String, generation: Long) {
+        if (wasInterrupted(id, generation)) throw CancellationException("容器已停止或重新启动")
+        ensureOpen()
+        ensureAvailable(id)
+    }
+
+    private suspend fun openTrackedTerminal(id: String, generation: Long, command: String?, onLaunch: (TrackedProcess) -> Unit = {}): TerminalSession {
+        var opened: TerminalSession? = null
+        try {
+            withContext(Dispatchers.IO) { mutex.withLock {
+                currentCoroutineContext().ensureActive()
+                ensurePackageTerminalAvailable(id, generation)
+                val config = config(id)
+                val arguments = terminalArguments(config.shell, command)
+                if (command != null) engines.requireGuestPackageRoot(config)
+                startLocked(id)
+                idleJobs.remove(id)?.cancel()
+                val tracked = launchLocked(config, arguments, "/workspace", emptyMap(), true, false, pty = true)
+                opened = object : TerminalSession {
+                    override val process = tracked.process
+                    override val processId = requireNotNull(tracked.pid)
+                    override val runGeneration = runGenerations.getValue(id)
+                    private val alive = MutableStateFlow(tracked.isAlive)
+                    override val isAlive = alive.asStateFlow()
+                    private val closing = java.util.concurrent.atomic.AtomicBoolean()
+                    init { scope.launch {
+                        try { awaitExit() }
+                        catch (cancelled: CancellationException) { throw cancelled }
+                        catch (failure: Exception) { terminalFailure(id, tracked, "终端退出跟踪失败", failure) }
+                        finally { alive.value = false }
+                    } }
+                    override suspend fun awaitExit(): Int = tracked.awaitExit()
+                    override fun resize(columns: Int, rows: Int, cellWidthPixels: Int, cellHeightPixels: Int) {
+                        require(columns > 0 && rows > 0)
+                        if (!closing.get() && !tracked.stopping && tracked.isAlive) {
+                            try { requireNotNull(tracked.terminal).resize(columns, rows, cellWidthPixels, cellHeightPixels) }
+                            catch (failure: Exception) { if (!closing.get() && !tracked.stopping && tracked.isAlive) throw failure }
+                        }
                     }
-                }
-                override fun close() {
-                    if (!closing.compareAndSet(false, true)) return
-                    scope.launch {
-                        mutex.withLock {
-                            val root = config.engine == ContainerEngineType.CHROOT
-                            try {
-                                tracked.refreshDescendants()
-                                terminate(listOf(tracked), root, false)
-                                if (process.isAlive) process.destroy()
-                                process.waitFor(2, TimeUnit.SECONDS)
-                                terminate(listOf(tracked), root, true)
-                                if (process.isAlive) process.destroyForcibly()
-                                waitForTrackedExit(listOf(tracked), 2)
-                                check(!tracked.hasLiveProcesses()) { "终端仍有已跟踪子进程未退出" }
-                            } catch (failure: Exception) {
-                                errors[id] = "终端关闭失败：${failure.message}"
-                                publish()
-                            } finally {
+                    override fun close() {
+                        if (!closing.compareAndSet(false, true)) return
+                        scope.launch {
+                            try { closeProcess(id, process) }
+                            catch (cancelled: CancellationException) { throw cancelled }
+                            catch (failure: Exception) { terminalFailure(id, tracked, "终端关闭失败", failure) }
+                            finally {
                                 try { tracked.terminal?.close() }
-                                catch (failure: Exception) { errors[id] = "终端 PTY 关闭失败：${failure.message}"; publish() }
+                                catch (failure: Exception) { terminalFailure(id, tracked, "终端 PTY 关闭失败", failure) }
                                 alive.value = false
                             }
                         }
                     }
                 }
-            }
-        } }
+                onLaunch(tracked)
+            } }
+            return checkNotNull(opened)
+        } catch (failure: Throwable) {
+            opened?.close()
+            throw failure
+        }
     }
 
-    override suspend fun probeToolchains(id: String): List<ToolchainInfo> = tools.map { tool ->
-        val output = execute(id, "if command -v ${tool.probe} >/dev/null 2>&1; then ${tool.version} 2>&1 | head -n 1; else printf '__WAWLINK_MISSING__'; fi", "/")
-        val missing = output.contains("__WAWLINK_MISSING__")
-        val version = if (missing) "" else output.trim().let { if (tool.id == "git") it.removePrefix("git version ") else it }
-        ToolchainInfo(tool.id, tool.title, tool.icon, !missing, version)
+    private suspend fun terminalFailure(id: String, tracked: TrackedProcess, phase: String, failure: Exception) = mutex.withLock {
+        if (processes[id]?.contains(tracked) == true) {
+            errors[id] = "$phase：${failure.message ?: failure.javaClass.simpleName}"
+            publish()
+        }
     }
 
-    override suspend fun changeToolchain(id: String, toolId: String, install: Boolean): String = packageLocks.getOrPut(id) { Mutex() }.withLock {
+    override suspend fun probeToolchains(id: String): List<ToolchainInfo> = withContainerFileOperation(this, id) {
+        tools.map { tool ->
+            val probe = probeTool(id, tool)
+            val version = if (probe.exitCode == 0) probe.output().lineSequence().firstOrNull { it.isNotBlank() }.orEmpty().trim() else ""
+            ToolchainInfo(tool.id, tool.title, tool.icon, probe.exitCode == 0, version.removePrefix(if (tool.id == "git") "git version " else ""),
+                unavailable = probe.exitCode != 0 && !probe.toolMissing)
+        }
+    }
+
+    private suspend fun probeTool(id: String, tool: Tool): PackageCommandResult = runPackageShell(id,
+        "if command -v ${tool.probe} >/dev/null 2>&1; then exec ${tool.version}; else printf '__WAWLINK_TOOL_MISSING__'; exit 127; fi",
+        "检查 ${tool.title} 版本", timeoutMs = 20_000)
+
+    override suspend fun changeToolchain(id: String, toolId: String, install: Boolean): String = withPackageOperation(id) {
         val tool = tools.firstOrNull { it.id == toolId } ?: error("未知工具链：$toolId")
-        val distro = mutex.withLock { config(id).distro }
-        val manager = manager(distro)
+        val manager = manager(mutex.withLock { config(id).distro })
         val packages = tool.packages.getValue(manager)
-        val command = PackageManagerCommands.toolchain(manager, packages, install)
-        val result = StringBuilder(execute(id, command, "/"))
+        val phase = if (install) "安装 ${tool.title}" else "卸载 ${tool.title}"
+        val result = StringBuilder(runPackageShell(id, PackageManagerCommands.toolchain(manager, packages, install), phase).requireSuccess(phase))
         if (toolId == "node" && !install) {
-            result.append(execute(id, """
+            val cleanup = """
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
                 marker=/usr/local/share/wawlink/preinstalled-node
                 if [ -f "${'$'}marker" ] && [ -x /usr/local/bin/node ] && [ "${'$'}(cat "${'$'}marker")" = "${'$'}(/usr/local/bin/node --version)" ]; then
-                    rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
-                    rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/include/node /usr/local/share/doc/node
+                    rm -f /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack &&
+                    rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack /usr/local/include/node /usr/local/share/doc/node &&
                     rm -f /usr/local/share/man/man1/node.1 "${'$'}marker"
                 fi
-            """.trimIndent(), "/"))
+            """.trimIndent()
+            val cleanupPhase = "清理受管预装 Node.js"
+            result.append(runPackageShell(id, cleanup, cleanupPhase).requireSuccess(cleanupPhase))
         }
-        val installed = execute(id, "if command -v ${tool.probe} >/dev/null 2>&1; then printf installed; fi", "/").trim() == "installed"
-        check(installed == install) {
-            if (install) "软件包命令已完成，但 ${tool.title} 仍不可执行，请查看包管理器输出：$result"
-            else "包管理器已卸载其管理的文件，但 ${tool.title} 仍在其他路径中；无法安全删除未知的手动安装，请在终端检查 command -v ${tool.probe}"
+        val probe = probeTool(id, tool)
+        if (install && probe.exitCode != 0) throw IllegalStateException(
+            "软件包命令已完成，但 ${tool.title} 的版本检查失败（${probe.exitCode}）",
+            IllegalStateException(probe.output().ifBlank { result.toString() }),
+        )
+        check(install || probe.toolMissing) {
+            "包管理器已卸载其管理的文件，但 ${tool.title} 仍在其他路径中；无法安全删除未知的手动安装，请在终端检查 command -v ${tool.probe}"
         }
         mutex.withLock { ensureOpen(); scheduleSize(config(id)) }
         result.toString()
@@ -1356,16 +1417,90 @@ class LocalContainerRuntime internal constructor(
     override suspend fun cleanPackageCaches(): Long {
         val ids = mutex.withLock { ensureOpen(); configurations.keys.toList() }
         var total = 0L
-        ids.forEach { id -> packageLocks.getOrPut(id) { Mutex() }.withLock {
+        ids.forEach { id -> withPackageOperation(id) {
             val manager = manager(mutex.withLock { config(id).distro })
             val cache = when (manager) { "apt" -> "/var/cache/apt/archives"; "apk" -> "/var/cache/apk"; "pacman" -> "/var/cache/pacman/pkg"; else -> "/var/cache/dnf" }
             val clean = PackageManagerCommands.clean(manager)
-            val result = execute(id, "before=\$(du -sk $cache 2>/dev/null | cut -f1); $clean && after=\$(du -sk $cache 2>/dev/null | cut -f1) && printf '\\n__WAWLINK_FREED__%s\\n' \"\$(( (\${before:-0} - \${after:-0}) * 1024 ))\"", "/")
+            val command = "before=\$(du -sk $cache 2>/dev/null | cut -f1)\n{\n$clean\n} && after=\$(du -sk $cache 2>/dev/null | cut -f1) && printf '\\n__WAWLINK_FREED__%s\\n' \"\$(( (\${before:-0} - \${after:-0}) * 1024 ))\""
+            val phase = "清理容器软件包缓存"
+            val result = runPackageShell(id, command, phase).requireSuccess(phase)
             val freed = Regex("__WAWLINK_FREED__(-?[0-9]+)").find(result)?.groupValues?.get(1)?.toLongOrNull() ?: error("无法读取实际缓存清理结果")
             total += freed.coerceAtLeast(0)
             mutex.withLock { ensureOpen(); scheduleSize(config(id)) }
         } }
         return total
+    }
+
+    private suspend fun <T> withPackageOperation(id: String, action: suspend () -> T): T {
+        val generation = containerStopGeneration(id)
+        val lease = acquirePackageLock(id)
+        try { return withContainerFileOperation(this, id, generation, block = action) }
+        finally { lease.unlock() }
+    }
+
+    private data class PackageCommandResult(val exitCode: Int, val stdout: String, val stderr: String) {
+        val toolMissing: Boolean get() = exitCode == 127 && stdout == "__WAWLINK_TOOL_MISSING__" && stderr.isBlank()
+        fun output(): String = when {
+            stderr.isBlank() -> stdout
+            stdout.isBlank() -> stderr
+            else -> "$stdout\n$stderr"
+        }
+        fun requireSuccess(phase: String): String {
+            val output = output()
+            if (exitCode != 0) throw IllegalStateException("$phase 失败（退出码 $exitCode）",
+                output.takeIf { it.isNotBlank() }?.let(::IllegalStateException))
+            return output
+        }
+    }
+
+    private suspend fun runPackageShell(id: String, command: String, phase: String, timeoutMs: Long = 30 * 60 * 1_000L): PackageCommandResult = coroutineScope {
+        val owner = currentCoroutineContext()
+        var launched: Process? = null
+        var failure: Throwable? = null
+        var drained = false
+        try {
+            // Assign ownership even if cancellation lands during engine startup and before dispatch returns.
+            withContext(NonCancellable) {
+                owner.ensureActive()
+                launched = openProcess(id, listOf("/bin/sh", "-c", command), "/")
+            }
+            val child = checkNotNull(launched)
+            child.outputStream.close()
+            val stdout = async(Dispatchers.IO) { runCatching { readPackageOutput(child.inputStream) } }
+            val stderr = async(Dispatchers.IO) { runCatching { readPackageOutput(child.errorStream) } }
+            val result = withTimeoutOrNull(timeoutMs) {
+                val exitCode = runInterruptible(Dispatchers.IO) { child.waitFor() }
+                PackageCommandResult(exitCode, stdout.await().getOrThrow(), stderr.await().getOrThrow())
+            } ?: error("$phase 超时（${timeoutMs / 1_000} 秒）")
+            drained = true
+            result
+        } catch (problem: Throwable) {
+            failure = problem
+            throw problem
+        } finally {
+            if (!drained) launched?.let { child ->
+                try { closeProcess(id, child) }
+                catch (cleanup: Exception) {
+                    if (failure == null) throw cleanup
+                    if (failure !== cleanup) failure.addSuppressed(cleanup)
+                }
+            }
+        }
+    }
+
+    /** Drain the complete stream without retaining an unbounded package log; errors commonly arrive last. */
+    private fun readPackageOutput(input: InputStream): String = input.bufferedReader(Charsets.UTF_8).use { reader ->
+        val buffer = CharArray(16 * 1024)
+        var end = 0
+        var wrapped = false
+        while (true) {
+            val count = reader.read(buffer, end, buffer.size - end)
+            if (count < 0) break
+            end += count
+            if (end == buffer.size) { end = 0; wrapped = true }
+        }
+        if (wrapped) "前部输出已省略\n" + String(buffer, end, buffer.size - end) + String(buffer, 0, end)
+        else String(buffer, 0, end)
     }
     private fun manager(distro: String): String = when (distro) {
         "ubuntu", "debian", "kali" -> "apt"; "alpine" -> "apk"; "arch", "archlinux", "archarm" -> "pacman"; "fedora" -> "dnf"; else -> error("发行版 $distro 未配置受支持的包管理器")
@@ -1465,6 +1600,13 @@ internal class TrackedProcess(
             }
         }
         try { refreshDescendants() } catch (failure: Throwable) { exitWatcher.cancel(); throw failure }
+    }
+
+    suspend fun awaitExit(): Int {
+        exitWatcher.join()
+        exitFailure?.let { throw it }
+        if (exitWatcher.isCancelled) throw CancellationException("进程退出跟踪已取消")
+        return process.exitValue()
     }
 
     val isAlive: Boolean get() = originalIsAlive()

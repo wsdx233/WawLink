@@ -252,7 +252,11 @@ internal fun EngineOwnershipConversionDialog(
     var pendingEngine by remember(c.id, c.engine) { mutableStateOf<ContainerEngineType?>(null) }
     var tools by remember(c.id) { mutableStateOf<List<ToolchainInfo>?>(null) }
     var probeError by remember(c.id) { mutableStateOf<String?>(null) }
-    var toolBusy by remember { mutableStateOf<String?>(null) }
+    val toolchainChanges by app.toolchainChanges.collectAsState()
+    val toolChange = toolchainChanges[c.id]
+    val toolBusy = toolChange?.toolId
+    var probing by remember(c.id) { mutableStateOf(false) }
+    var refreshRunningOnly by remember(c.id, c.engine, c.user) { mutableStateOf(toolBusy != null) }
     var pendingTool by remember(c.id) { mutableStateOf<ToolchainInfo?>(null) }
     var mountEditor by remember { mutableStateOf<ContainerMount?>(null) }
     var addMount by remember { mutableStateOf(false) }
@@ -267,8 +271,24 @@ internal fun EngineOwnershipConversionDialog(
     var metadataEditor by remember(c.id) { mutableStateOf(false) }
     var metadataRetryBusy by remember(c.id) { mutableStateOf(false) }
     val uiScope = rememberCoroutineScope()
-    suspend fun probe() { probeError = null; try { tools = withContext(Dispatchers.IO) { app.runtime.probeToolchains(c.id) } } catch (e: Exception) { probeError = e.message ?: e.toString() } }
-    LaunchedEffect(c.id, c.engine, c.user) { probe() }
+    suspend fun probe(runningOnly: Boolean = false) {
+        if (probing) return
+        probing = true
+        probeError = null
+        try {
+            tools = withContext(Dispatchers.IO) {
+                withContainerFileOperation(app.runtime, c.id, info.stopGeneration, runningOnly) { app.runtime.probeToolchains(c.id) }
+            }
+        } catch (cancelled: CancellationException) {
+            currentCoroutineContext().ensureActive()
+        } catch (failure: Exception) { probeError = failure.message ?: failure.toString() }
+        finally { probing = false }
+    }
+    LaunchedEffect(c.id, c.engine, c.user, toolBusy) {
+        val runningOnly = refreshRunningOnly
+        refreshRunningOnly = true
+        if (toolBusy == null && (!runningOnly || info.running)) probe(runningOnly)
+    }
     fun configurationBusy(): Boolean = updateBusy || app.busy.value > 0 || toolBusy != null ||
         app.runtime.deployments.value.any { it.id == c.id && it.error == null && (it.progress?.let { fraction -> fraction < 1f } ?: true) }
     fun update(next: ContainerConfig, migrateOwnership: Boolean = !next.ownershipMigrationDeferred, onSuccess: () -> Unit = {}) {
@@ -350,8 +370,18 @@ internal fun EngineOwnershipConversionDialog(
                     Switch(c.hostRootAccess, { update(c.copy(hostRootAccess = it)) }, enabled = engineEnabled && pendingEngine == null)
                 }
             }
-            SectionLabel("预装工具链", "construction", action = { TextButton({ uiScope.launch { probe() } }, enabled = toolBusy == null) { Text("重新探测") } })
-            if (tools == null && probeError == null) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text("正在容器内探测实际工具版本", Modifier.padding(12.dp)) }
+            SectionLabel("预装工具链", "construction", action = {
+                if (toolChange != null) TextButton({ toolChange.job.cancel() }) { Text("取消操作") }
+                else TextButton({ uiScope.launch { probe() } }, enabled = !probing) { Text("重新探测") }
+            })
+            if (tools == null && probeError == null) {
+                if (probing || toolBusy != null) LinearProgressIndicator(Modifier.fillMaxWidth())
+                Text(when {
+                    toolBusy != null -> "正在执行工具链操作"
+                    probing -> "正在容器内探测实际工具版本"
+                    else -> "重新探测可读取容器中的工具版本"
+                }, Modifier.padding(12.dp))
+            }
             probeError?.let { ErrorMessage(it) }
             tools?.chunked(2)?.forEach { row -> Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 row.forEach { tool ->
@@ -363,7 +393,12 @@ internal fun EngineOwnershipConversionDialog(
                         }
                         Column(Modifier.weight(1f)) {
                             Text(tool.title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                            Text(if (toolBusy == tool.id) "正在执行…" else if (tool.installed) tool.version else "未安装", fontSize = 15.sp, fontFamily = LocalAgentMono.current, softWrap = true, color = if (tool.installed) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(when {
+                                toolBusy == tool.id -> "正在执行…"
+                                tool.installed -> tool.version
+                                tool.unavailable -> "版本检查失败"
+                                else -> "未安装"
+                            }, fontSize = 15.sp, fontFamily = LocalAgentMono.current, softWrap = true, color = if (tool.installed) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 }
@@ -417,16 +452,7 @@ internal fun EngineOwnershipConversionDialog(
                 TextButton({
                     if (toolBusy == null && pendingTool != null) {
                         pendingTool = null
-                        toolBusy = tool.id
-                        uiScope.launch {
-                            try {
-                                val output = withContext(Dispatchers.IO) { app.runtime.changeToolchain(c.id, tool.id, !tool.installed) }
-                                app.report(output.ifBlank { "${tool.title} ${operation}已完成" })
-                                probe()
-                            } catch (cancelled: CancellationException) { throw cancelled }
-                            catch (failure: Exception) { app.showError(failure) }
-                            finally { toolBusy = null }
-                        }
+                        app.changeToolchain(c.id, tool)
                     }
                 }, enabled = toolBusy == null) { Text("确认$operation") }
             },

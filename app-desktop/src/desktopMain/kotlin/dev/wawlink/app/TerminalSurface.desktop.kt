@@ -22,10 +22,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /** JediTerm supplies ANSI/cursor emulation, raw keys, selection and Ctrl+Shift+C/V. */
 @Composable
-internal fun TerminalSurface(session: TerminalSession, modifier: Modifier) {
+internal fun TerminalSurface(session: TerminalSession, modifier: Modifier, retainOnDetach: Boolean) {
     val scale = LocalAgentAppearance.current.densityScale * LocalDensity.current.fontScale
     val currentScale by rememberUpdatedState(scale)
-    val widget = remember(session) {
+    val widget = remember(session, retainOnDetach) {
         object : JediTermWidget(object : DefaultSettingsProvider() {
             override fun getDefaultStyle() = TextStyle(TerminalColor.rgb(230, 237, 243), TerminalColor.rgb(13, 17, 23))
             override fun getTerminalFontSize() = 15f * currentScale
@@ -41,7 +41,7 @@ internal fun TerminalSurface(session: TerminalSession, modifier: Modifier) {
             override fun createTerminalPanel(settings: SettingsProvider, style: StyleState, buffer: TerminalTextBuffer): TerminalPanel =
                 ScaledTerminalPanel(settings, buffer, style)
         }.apply {
-            ttyConnector = ContainerTtyConnector(session)
+            ttyConnector = ContainerTtyConnector(session, closeSession = !retainOnDetach)
             start()
         }
     }
@@ -61,7 +61,7 @@ private class ScaledTerminalPanel(settings: SettingsProvider, buffer: TerminalTe
     }
 }
 
-private class ContainerTtyConnector(private val session: TerminalSession) : TtyConnector {
+private class ContainerTtyConnector(private val session: TerminalSession, private val closeSession: Boolean) : TtyConnector {
     private val reader = InputStreamReader(session.process.inputStream, Charsets.UTF_8)
     private val closed = AtomicBoolean()
     override fun read(buffer: CharArray, offset: Int, length: Int) = reader.read(buffer, offset, length)
@@ -77,5 +77,5 @@ private class ContainerTtyConnector(private val session: TerminalSession) : TtyC
     override fun ready() = reader.ready()
     override fun waitFor() = session.process.waitFor()
     override fun getName() = "WawLink 容器终端"
-    override fun close() { if (closed.compareAndSet(false, true)) session.close() }
+    override fun close() { if (closed.compareAndSet(false, true) && closeSession) session.close() }
 }

@@ -18,7 +18,11 @@ internal class OmpGuestFileException(val code: String, val guestPath: String) : 
 internal data class OmpGuestEntry(val name: String, val directory: Boolean, val regular: Boolean, val size: Long, val modified: Long)
 
 /** One guest-account file worker per running container; captured sessions never reconnect. */
-internal class OmpGuestFiles(private val runtime: ContainerRuntime, private val containerId: String) : AutoCloseable {
+internal class OmpGuestFiles(
+    private val runtime: ContainerRuntime,
+    private val containerId: String,
+    private val startupFailed: (ContainerInfo) -> Unit = {},
+) : AutoCloseable {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lifecycle = Mutex()
     @Volatile private var current: OmpFileSession? = null
@@ -39,19 +43,27 @@ internal class OmpGuestFiles(private val runtime: ContainerRuntime, private val 
             current?.let { if (it.isCurrent() && it.alive) return@withLock it; it.close(); current = null }
             var child: Process? = null
             try {
-                withContainerFileOperation(runtime, containerId, expected, runningOnly) {
+                val started = withContainerFileOperation(runtime, containerId, expected, runningOnly) {
                     val args = listOf("/usr/local/bin/bun", "-e", source)
                     val environment = mapOf("WAWLINK_FILE_HOME" to containerHome(info.config), "WAWLINK_FILE_MOUNTS" to JsonArray(info.config.mounts.map { mount -> buildJsonObject {
                         put("target", mount.target.trimEnd('/').ifEmpty { "/" }); put("readWrite", mount.readWrite)
                     } }).toString())
                     child = if (runningOnly) runtime.openRunningProcess(containerId, args, "/", environment) else runtime.openProcess(containerId, args, "/", environment)
-                    val started = runtime.containers.value.firstOrNull { it.config.id == containerId } ?: throw OmpProcessStoppedException()
-                    OmpFileSession(runtime, started, requireNotNull(child), scope)
-                }.also { session ->
+                    runtime.containers.value.firstOrNull { it.config.id == containerId && it.running && it.stopGeneration == expected }
+                        ?: throw OmpProcessStoppedException()
+                }
+                OmpFileSession(runtime, started, requireNotNull(child), scope, startupFailed).also { session ->
                     if (closed || !session.isCurrent()) { session.close(); throw OmpProcessStoppedException() }
                     current = session
                 }
-            } catch (failure: Throwable) { child?.destroy(); throw failure }
+            } catch (failure: Throwable) {
+                child?.destroy()
+                if (child == null && !closed && failure is Exception && failure !is CancellationException && failure !is OmpProcessStoppedException) {
+                    runtime.containers.value.firstOrNull { it.config.id == containerId && it.running && it.stopGeneration == expected &&
+                        (!info.running || it.runGeneration == info.runGeneration) }?.let(startupFailed)
+                }
+                throw failure
+            }
         }
         }
     }
@@ -63,6 +75,7 @@ internal class OmpGuestFiles(private val runtime: ContainerRuntime, private val 
 
 internal class OmpFileSession(
     private val runtime: ContainerRuntime, private val info: ContainerInfo, private val child: Process, scope: CoroutineScope,
+    private val startupFailed: (ContainerInfo) -> Unit,
 ) : AutoCloseable {
     val stopGeneration = info.stopGeneration
     val runGeneration = info.runGeneration
@@ -72,23 +85,31 @@ internal class OmpFileSession(
     private val pending = ConcurrentHashMap<String, CompletableDeferred<JsonElement>>()
     private val output = Mutex()
     @Volatile private var closed = false
+    @Volatile private var hasResponded = false
     @Volatile private var processFailure: IOException? = null
     init {
         scope.launch {
+            var failure: Exception? = null
             try {
                 readManagementFrames(child.inputStream) { frame ->
                     val id = frame["id"]?.jsonPrimitive?.content ?: return@readManagementFrames
-                    val result = pending.remove(id) ?: return@readManagementFrames
-                    val error = frame["error"] as? JsonObject
-                    if (error != null) result.completeExceptionally(OmpGuestFileException(error["code"]!!.jsonPrimitive.content, error["path"]?.jsonPrimitive?.content.orEmpty()))
+                    val result = pending[id] ?: return@readManagementFrames
+                    val error = (frame["error"] as? JsonObject)?.let {
+                        OmpGuestFileException(it["code"]!!.jsonPrimitive.content, it["path"]?.jsonPrimitive?.content.orEmpty())
+                    }
+                    hasResponded = true
+                    if (!pending.remove(id, result)) return@readManagementFrames
+                    if (error != null) result.completeExceptionally(error)
                     else result.complete(frame["result"] ?: JsonNull)
                 }
-            } catch (failure: Exception) {
-                if (!closed && isCurrent()) processFailure = IOException("容器文件通道读取失败", failure)
+            } catch (caught: Exception) {
+                failure = caught
+                if (caught is CancellationException) throw caught
             } finally {
-                if (!closed && isCurrent() && processFailure == null) processFailure = IOException("容器文件进程异常退出")
-                failPending(processFailure ?: OmpProcessStoppedException())
-                close()
+                val cause = failure
+                if (cause is CancellationException || !currentCoroutineContext().isActive) close()
+                else finish(if (cause == null) IOException("容器文件进程异常退出") else IOException("容器文件通道读取失败", cause),
+                    inspectStartup = cause == null || cause is IOException && cause !is OmpProtocolException)
             }
         }
         scope.launch {
@@ -104,11 +125,18 @@ internal class OmpFileSession(
         if (!isCurrent()) throw OmpProcessStoppedException()
         if (closed) throw processFailure ?: OmpProcessStoppedException()
     }
-    private fun failPending(failure: Throwable) { pending.values.forEach { it.completeExceptionally(failure) }; pending.clear() }
-    override fun close() {
-        if (closed) return
-        closed = true
-        failPending(processFailure ?: OmpProcessStoppedException())
+    override fun close() = finish()
+
+    private fun finish(failure: IOException? = null, inspectStartup: Boolean = false) {
+        val inspect = synchronized(this) {
+            if (closed) return
+            processFailure = failure?.takeIf { isCurrent() }
+            closed = true
+            inspectStartup && processFailure != null && !hasResponded
+        }
+        if (inspect) startupFailed(info)
+        pending.values.forEach { it.completeExceptionally(processFailure ?: OmpProcessStoppedException()) }
+        pending.clear()
         runCatching { child.outputStream.close() }
         child.destroy()
     }
@@ -144,14 +172,13 @@ internal class OmpFileSession(
                         if (release != null && completed is JsonPrimitive && completed !is JsonNull) request(release, mapOf("token" to completed.content))
                     }
                 } catch (failure: Exception) {
-                    if (isCurrent() && processFailure == null) processFailure = IOException("容器文件操作取消清理失败", failure)
-                    close()
+                    finish(IOException("容器文件操作取消清理失败", failure))
                 }
             }
             throw cancelled
         } catch (failure: Exception) {
             if (!isCurrent()) throw OmpProcessStoppedException()
-            if (failure is IOException && failure !is OmpGuestFileException) { processFailure = failure; close() }
+            if (failure is IOException && failure !is OmpGuestFileException) finish(failure, inspectStartup = true)
             throw failure
         } finally { pending.remove(id) }
     }

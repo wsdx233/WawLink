@@ -53,7 +53,7 @@ data class DeploymentProgress(val id: String, val name: String, val progress: Fl
     val cancellable: Boolean = false, val retryable: Boolean = false)
 enum class MirrorSource(val label: String) { OFFICIAL("官方源"), TSINGHUA("清华镜像"), ALIYUN("阿里镜像"), USTC("中科大镜像") }
 data class DistroSpec(val id: String, val name: String, val version: String, val arch: String = "arm64", val icon: String = "deployed_code")
-data class ToolchainInfo(val id: String, val title: String, val icon: String, val installed: Boolean, val version: String = "")
+data class ToolchainInfo(val id: String, val title: String, val icon: String, val installed: Boolean, val version: String = "", val unavailable: Boolean = false)
 data class RuntimePaths(
     val dataDir: File,
     val nativeLibraryDir: File? = null,
@@ -71,6 +71,8 @@ interface TerminalSession : AutoCloseable {
     val process: Process
     val processId: Long
     val isAlive: StateFlow<Boolean>
+    val runGeneration: Long
+    suspend fun awaitExit(): Int
     fun resize(columns: Int, rows: Int, cellWidthPixels: Int = 0, cellHeightPixels: Int = 0)
 }
 data class RootfsExportSanitization(
@@ -126,8 +128,9 @@ interface ContainerRuntime : AutoCloseable {
         if (!process.waitFor(2, TimeUnit.SECONDS)) process.destroyForcibly()
         check(process.waitFor(2, TimeUnit.SECONDS)) { "容器命令未能退出" }
     }
-    /** Runs an optional trusted script once via /bin/sh, then keeps the configured interactive shell open. */
-    suspend fun openTerminal(id: String, initialCommand: String? = null): TerminalSession
+    suspend fun openTerminal(id: String): TerminalSession
+    /** Runs the authorized package script in its own PTY; its exit status is the script's, not a later shell's. */
+    suspend fun openPackageTerminal(id: String, stopGeneration: Long, command: String, beforeStart: suspend () -> Unit): TerminalSession
     suspend fun register(config: ContainerConfig)
 }
 

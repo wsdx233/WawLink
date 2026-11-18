@@ -30,6 +30,7 @@ public final class TerminalSession extends TerminalOutput {
 
     private static final int MSG_NEW_INPUT = 1;
     private static final int MSG_PROCESS_EXITED = 4;
+    private static final int MSG_OUTPUT_DRAINED = 5;
     private static final long OUTPUT_UPDATE_DELAY_MS = 16L;
 
     public final String mHandle = UUID.randomUUID().toString();
@@ -140,6 +141,9 @@ public final class TerminalSession extends TerminalOutput {
                     }
                 } catch (Throwable failure) {
                     if (!isExpectedIoFailure(failure)) shutdownFromWorker(failure);
+                } finally {
+                    // waitFor can win the race against our final PTY read, including after reattach.
+                    mMainThreadHandler.sendEmptyMessage(MSG_OUTPUT_DRAINED);
                 }
             }
         }.start();
@@ -165,6 +169,7 @@ public final class TerminalSession extends TerminalOutput {
             public void run() {
                 try {
                     int processExitCode = mProcess.waitFor();
+                    mTerminalToProcessIOQueue.close();
                     mMainThreadHandler.sendMessage(mMainThreadHandler.obtainMessage(MSG_PROCESS_EXITED, processExitCode));
                 } catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
@@ -362,6 +367,8 @@ public final class TerminalSession extends TerminalOutput {
     class MainThreadHandler extends Handler {
 
         final byte[] mReceiveBuffer = new byte[4 * 1024];
+        private boolean outputDrained;
+        private Integer exitCode;
         private boolean processPendingOutput() {
             int bytesRead = mProcessToTerminalIOQueue.read(mReceiveBuffer, false);
             if (bytesRead <= 0) return false;
@@ -380,16 +387,19 @@ public final class TerminalSession extends TerminalOutput {
                 }
                 return;
             }
-            if (msg.what != MSG_PROCESS_EXITED) return;
-            Throwable failure = mThreadFailure;
-            if (failure != null) Logger.logStackTraceWithMessage(mClient, LOG_TAG, "Terminal worker failed", failure);
+            if (msg.what == MSG_OUTPUT_DRAINED) outputDrained = true;
+            else if (msg.what == MSG_PROCESS_EXITED) exitCode = (Integer) msg.obj;
+            else return;
             if (!isRunning()) return;
+            Throwable failure = mThreadFailure;
+            if (failure == null && (!outputDrained || exitCode == null)) return;
+            if (failure != null) Logger.logStackTraceWithMessage(mClient, LOG_TAG, "Terminal worker failed", failure);
 
             while (processPendingOutput()) { }
-            int exitCode = failure == null ? (Integer) msg.obj : -1;
-            cleanupResources(exitCode);
+            int status = failure == null ? exitCode : -1;
+            cleanupResources(status);
 
-            String exitDescription = "\r\n[终端进程已退出：" + exitCode + "]";
+            String exitDescription = "\r\n[终端进程已退出：" + status + "]";
             if (failure != null) {
                 exitDescription += "\r\n[终端错误：" + failure + "]";
             }

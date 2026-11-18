@@ -428,6 +428,12 @@ internal class RuntimeEngines(
     private fun namespaceCheck(namespace: String): String =
         "[ \"${'$'}(readlink /proc/self/ns/mnt)\" = ${shellQuote(namespace)} ] || { echo 'su 挂载命名空间已改变，保留挂载并拒绝操作' >&2; exit 125; }\n"
 
+    fun requireGuestPackageRoot(config: ContainerConfig) {
+        check(loginIdentity(config, filesystemRootRunner(config)).uid == "0") {
+            "容器包操作需要客体 root；请先在容器详情切换登录用户。应用不会自动提权。"
+        }
+    }
+
     fun builder(config: ContainerConfig, arguments: List<String>, cwd: String, environment: Map<String, String>, mergeError: Boolean, rootPidFile: File? = null): ProcessBuilder {
         require(arguments.isNotEmpty() && arguments.none { '\u0000' in it }) { "容器启动参数无效" }
         require(cwd.startsWith('/') && '\u0000' !in cwd && !cwd.split('/').contains("..")) { "工作目录必须是容器内绝对路径" }

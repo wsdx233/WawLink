@@ -5,6 +5,8 @@ import dev.wawlink.runtime.ContainerInfo
 import dev.wawlink.runtime.ContainerRuntime
 import dev.wawlink.runtime.LocalContainerRuntime
 import dev.wawlink.runtime.RuntimePaths
+import java.io.File
+import java.nio.file.attribute.PosixFilePermissions
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
@@ -58,7 +60,7 @@ class OmpInstallationTest {
             }
             val error = assertFailsWith<IllegalStateException> { OmpInstallation.inspect(runtime, "guest") }
             assertTrue(error.message.orEmpty().contains("127"))
-            assertTrue(error.message.orEmpty().contains("guest interpreter failed"))
+            assertTrue(generateSequence(error as Throwable) { it.cause }.any { it.message == "guest interpreter failed" }, error.stackTraceToString())
         }
     }
 
@@ -70,13 +72,137 @@ class OmpInstallationTest {
         }
     }
 
-    @Test fun bundledInstallerRepairsDpkgBeforeAptPrerequisites() {
-        val installer = OmpInstallation.command()
-        val repair = installer.indexOf("DEBIAN_FRONTEND=noninteractive dpkg --configure -a")
-        val aptBranch = installer.indexOf("apt-get -o APT::Update::Error-Mode=any update")
-        assertTrue(repair >= 0)
-        assertTrue(aptBranch > repair)
-        assertTrue(installer.indexOf("repair_dpkg", repair) < aptBranch)
+    @Test fun packageLockPrecedesPrerequisitesAndFailedRepairReleasesIt() {
+        val directory = Files.createTempDirectory("wawlink-install-lock-").toFile()
+        try {
+            val tools = File(directory, "tools").apply { mkdirs() }
+            val lock = File(directory, "opt/.wawlink-omp-install.lock").apply { mkdirs() }
+            File(directory, "os-release").writeText("ID=ubuntu\nVERSION_ID=24.04\n")
+            val log = File(directory, "calls")
+            fun executable(name: String, body: String) = File(tools, name).apply {
+                writeText("#!/bin/sh\n$body\n")
+                assertTrue(setExecutable(true))
+            }
+            executable("id", "echo 0")
+            executable("dpkg", "[ -d '${lock.path}' ] || exit 92; umask > '${log.path}'; exit 43")
+            executable("apt-get", "printf 'unexpected apt\\n' >> '${log.path}'")
+            val script = OmpInstallation.command()
+                .replace("/etc/os-release", File(directory, "os-release").path)
+                .replace("/opt", File(directory, "opt").path)
+                .replace("/usr", File(directory, "usr").path)
+                .replace(Regex("(?m)^export PATH=.*$"), "export PATH=${tools.path}:/usr/bin:/bin")
+            fun runInstaller(): Int {
+                val process = ProcessBuilder("/bin/sh", "-c", script).redirectErrorStream(true).start()
+                process.inputStream.use { it.readBytes() }
+                return process.waitFor()
+            }
+            assertEquals(1, runInstaller())
+            assertTrue(!log.exists())
+            assertTrue(lock.delete())
+            assertEquals(43, runInstaller())
+            assertEquals("0022", log.readText().trim())
+            assertTrue(!lock.exists())
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun inspectionEnvironmentFailuresNeverSuggestReinstallAndKeepDiagnostics() = runBlocking {
+        fixture { base ->
+            for (diagnostic in listOf("EACCES: private native addon", "OMP RPC probe timed out after 45 seconds")) {
+                val runtime = object : ContainerRuntime by base {
+                    override suspend fun openProcess(id: String, arguments: List<String>, cwd: String, environment: Map<String, String>): Process =
+                        ResultProcess("", 75, diagnostic)
+                }
+                val failure = assertFailsWith<IllegalStateException> { OmpInstallation.inspect(runtime, "guest") }
+                assertTrue(generateSequence(failure as Throwable) { it.cause }.any { it.message == diagnostic }, failure.stackTraceToString())
+                assertTrue(!failure.message.orEmpty().contains(diagnostic))
+            }
+            val runtime = object : ContainerRuntime by base {
+                override suspend fun openProcess(id: String, arguments: List<String>, cwd: String, environment: Map<String, String>): Process =
+                    ResultProcess("WAWLINK_OMP_CHECK\tBROKEN\tnative failure\n", diagnostic = "ELF symbol missing: actual native diagnostic")
+            }
+            val result = OmpInstallation.inspect(runtime, "guest")
+            assertEquals(OmpInstallationState.BROKEN, result.state)
+            assertTrue(result.diagnostic.contains("ELF symbol missing"))
+            assertTrue(!result.message.contains("ELF symbol missing"))
+        }
+    }
+
+    @Test fun inspectionClosesOwnedProcessWithoutMaskingOriginalFailure() = runBlocking {
+        fixture { base ->
+            var closed = 0
+            val child = ResultProcess("", 75, "original isolated probe failure")
+            val runtime = object : ContainerRuntime by base {
+                override suspend fun openProcess(id: String, arguments: List<String>, cwd: String, environment: Map<String, String>): Process = child
+                override suspend fun closeProcess(id: String, process: Process) {
+                    assertTrue(process === child)
+                    closed++
+                    error("cleanup failure")
+                }
+            }
+            val failure = assertFailsWith<IllegalStateException> { OmpInstallation.inspect(runtime, "guest") }
+            assertEquals(1, closed)
+            val chain = generateSequence(failure as Throwable) { it.cause }.toList()
+            assertTrue(chain.any { it.message == "original isolated probe failure" }, failure.stackTraceToString())
+            assertEquals("cleanup failure", chain.flatMap { it.suppressed.asList() }.single().message)
+        }
+    }
+
+    @Test fun realPosixInspectionDistinguishesProbeTimeoutFromBrokenNative() {
+        val directory = Files.createTempDirectory("wawlink-inspect-shell-").toFile()
+        try {
+            File(directory, "opt/omp/dist").mkdirs()
+            File(directory, "opt/omp/dist/cli.js").writeText("fixture")
+            val bin = File(directory, "usr/local/bin").apply { mkdirs() }
+            File(bin, "omp").apply { writeText("#!/bin/sh\nexit 0\n"); setExecutable(true) }
+            val script = OmpInstallation.command()
+                .replace("/opt", File(directory, "opt").path)
+                .replace("/usr", File(directory, "usr").path)
+            for ((status, expectedExit) in listOf(75 to 75, 126 to 75, 1 to 0)) {
+                File(bin, "bun").apply {
+                    writeText("#!/bin/sh\nprintf 'probe diagnostic $status\\n' >&2\nexit $status\n")
+                    setExecutable(true)
+                }
+                val process = ProcessBuilder("/bin/sh", "-c", script, "fixture", "--inspect").start()
+                val stdout = process.inputStream.bufferedReader().use { it.readText() }
+                val stderr = process.errorStream.bufferedReader().use { it.readText() }
+                assertEquals(expectedExit, process.waitFor())
+                assertTrue(stderr.contains("probe diagnostic $status"))
+                if (expectedExit == 0) assertTrue(stdout.contains("WAWLINK_OMP_CHECK\tBROKEN\t"))
+                else assertTrue(!stdout.contains("WAWLINK_OMP_CHECK"))
+            }
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun restrictiveUmaskPublishesOnlyReadableExecutableProgramTree() {
+        val directory = Files.createTempDirectory("wawlink-install-modes-").toFile()
+        try {
+            val installer = OmpInstallation.command()
+            val publication = installer.substringAfter("# executable payload becomes public; staging, probe HOME and backups stay 700.\n")
+                .substringBefore("progress 'Switching validated installation")
+            assertTrue(publication.contains("find \"${'$'}stage/omp\""))
+            val process = ProcessBuilder("/bin/sh", "-c", """
+                set -eu
+                umask 0077
+                stage='${directory.path}/stage'
+                mkdir -p "${'$'}stage/omp/node_modules" "${'$'}stage/home"
+                printf 'native bytes' > "${'$'}stage/omp/node_modules/native.node"
+                printf '#!/bin/sh\n' > "${'$'}stage/omp/program"
+                chmod 700 "${'$'}stage/omp/program"
+                printf 'private configuration' > "${'$'}stage/home/config.yml"
+                $publication
+                mv "${'$'}stage/omp" '${directory.path}/published'
+            """.trimIndent()).start()
+            val diagnostic = process.errorStream.bufferedReader().use { it.readText() }
+            assertEquals(0, process.waitFor(), diagnostic)
+            fun mode(path: String) = PosixFilePermissions.toString(Files.getPosixFilePermissions(File(directory, path).toPath()))
+            assertEquals("rwxr-xr-x", mode("published"))
+            assertEquals("rwxr-xr-x", mode("published/node_modules"))
+            assertEquals("rw-r--r--", mode("published/node_modules/native.node"))
+            assertEquals("rwxr-xr-x", mode("published/program"))
+            assertEquals("rwx------", mode("stage"))
+            assertEquals("rwx------", mode("stage/home"))
+            assertEquals("rw-------", mode("stage/home/config.yml"))
+        } finally { directory.deleteRecursively() }
     }
 
     @Test fun staleInspectionAndRunningOnlyInspectionNeverOpenStoppedContainer() = runBlocking {

@@ -400,9 +400,9 @@ private val chatErrorStatusCode = Regex("(?<![0-9])(?:401|403|404|429)(?![0-9])"
 
 private fun chatErrorCandidates(error: String, modelId: String): List<ChatErrorAction> {
     val text = error.lowercase()
-    val ompFailure = listOf("omp 缺失", "安装损坏", "omp 输出流已关闭", "omp 通信响应损坏",
-        "omp 进程未启动", "omp 进程异常", "omp 通信失效", "cannot find module").any(text::contains) ||
-        ("enoent" in text && "omp" in text)
+    // Process exits, protocol errors and missing workspace/plugin files are not installation evidence.
+    val ompFailure = "omp 缺失" in text || "omp 安装损坏" in text ||
+        "omp 缺失或安装损坏" in text
     val sessionFailure = listOf("会话管理", "历史树", "agent hub", "session management").any(text::contains)
     val defaultRole = "默认模型" in text || ("default" in text && listOf("model", "role", "模型", "角色").any(text::contains))
     val modelFailure = defaultRole || listOf("缺少服务标识", "缺少模型标识", "没有可用模型", "模型不可用", "未配置模型",

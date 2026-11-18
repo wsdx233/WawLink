@@ -136,6 +136,7 @@ class MainActivity : ComponentActivity(), HostFiles {
     override fun onResume() {
         super.onResume()
         refreshBatteryOptimizationStatus()
+        (application as WawLinkApplication).onHostResumed()
     }
     private fun refreshBatteryOptimizationStatus(): Boolean {
         val ignoring = getSystemService(PowerManager::class.java)?.isIgnoringBatteryOptimizations(packageName) == true

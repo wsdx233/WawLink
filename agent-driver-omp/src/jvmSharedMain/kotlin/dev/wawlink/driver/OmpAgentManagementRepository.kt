@@ -30,6 +30,7 @@ internal class OmpAgentManagementRepository(
     private val applyDefault: suspend (ManagedRole) -> Unit,
     private val runtimeFailure: (Long, String) -> Unit,
     loadInitially: Boolean = true,
+    private val repairInProgress: () -> Boolean = { false },
 ) : AgentManagementRepository, AutoCloseable {
     private val job = SupervisorJob(parentScope.coroutineContext[Job])
     private val scope = CoroutineScope(parentScope.coroutineContext + job + Dispatchers.IO)
@@ -39,16 +40,21 @@ internal class OmpAgentManagementRepository(
     private val operations = Mutex()
     private val output = Mutex()
     private val sequence = AtomicLong()
+    @Volatile internal var rpcTiming = OmpRpcTiming(requestMs = 180_000)
     private data class PendingRequest(val child: Process, val result: CompletableDeferred<JsonElement>, val models: MutableList<ManagedModel>?)
     private val pending = ConcurrentHashMap<String, PendingRequest>()
     @Volatile private var closed = false
-    private class NativeChild(val process: Process, val files: OmpFileSession) {
+    private class NativeChild(val process: Process, val files: OmpFileSession, val launch: Long, val park: Long) {
         val stopGeneration: Long get() = files.stopGeneration
         @Volatile var intentional = false
-        val reported = AtomicBoolean()
+        @Volatile var terminalFailure: Throwable? = null
+        val liveness = OmpLiveness()
+        val probing = AtomicBoolean()
+        val startupCheck = AtomicBoolean()
     }
     private val nativeChild = AtomicReference<NativeChild?>()
     private val parkGeneration = AtomicLong()
+    private val launchSequence = AtomicLong()
     private val needsReload = AtomicBoolean(!loadInitially)
     private val versions = mutableMapOf<String, String>()
 
@@ -127,12 +133,14 @@ internal class OmpAgentManagementRepository(
     private suspend fun start(fileSession: OmpFileSession) = lifecycle.withLock {
         val stopGeneration = fileSession.stopGeneration
         check(!closed) { "Agent management is closed" }
+        check(!repairInProgress()) { OMP_REPAIR_BUSY }
         if (runtime.wasInterrupted(context.containerId, stopGeneration)) throw OmpProcessStoppedException()
         nativeChild.get()?.let { owner ->
             if (!interrupted(owner) && owner.files === fileSession && owner.process.isAlive) return@withLock
             stopOwned(owner)
         }
         val generation = parkGeneration.get()
+        val launch = launchSequence.incrementAndGet()
         val guestRoot = scopedPath(guestDirectory())
         val destination = scopedPath("$guestRoot/wawlink/management", write = true)
         fileSession.mkdirs(destination)
@@ -151,18 +159,10 @@ internal class OmpAgentManagementRepository(
         catch (failure: Exception) {
             launched?.let(::stop)
             if (runtime.wasInterrupted(context.containerId, stopGeneration) || generation != parkGeneration.get()) throw OmpProcessStoppedException()
-            scope.launch {
-                if (closed || generation != parkGeneration.get() || runtime.wasInterrupted(context.containerId, stopGeneration)) return@launch
-                val check = try { OmpInstallation.inspect(runtime, context.containerId, stopGeneration, runningOnly = true) }
-                catch (cancelled: CancellationException) { throw cancelled }
-                catch (_: Exception) { return@launch }
-                if (!closed && generation == parkGeneration.get() && !runtime.wasInterrupted(context.containerId, stopGeneration) && check.state != OmpInstallationState.READY) {
-                    runtimeFailure(stopGeneration, "容器中的 OMP 缺失或安装损坏，请在终端中安装修复")
-                }
-            }
+            checkStartup(fileSession, launch, generation)
             throw failure
         }
-        val owner = NativeChild(child, fileSession)
+        val owner = NativeChild(child, fileSession, launch, generation)
         nativeChild.set(owner)
         if (closed || generation != parkGeneration.get() || interrupted(owner)) { stopOwned(owner); throw OmpProcessStoppedException() }
         scope.launch {
@@ -174,14 +174,21 @@ internal class OmpAgentManagementRepository(
             try {
                 readManagementFrames(child.inputStream) { frame ->
                     if (nativeChild.get() !== owner || interrupted(owner)) throw OmpProcessStoppedException()
+                    val identity = frame["id"] as? JsonPrimitive
+                    val event = frame["event"] as? JsonPrimitive
+                    if ((identity == null || !identity.isString || identity.content.isBlank()) &&
+                        (event == null || !event.isString || event.content.isBlank())) {
+                        throw OmpProtocolException("原生配置协议响应缺少身份，请重新加载")
+                    }
+                    owner.liveness.received()
                     when (frame.text("event")) {
                         "authentication" -> mutable.update { it.copy(error = frame.optional("error"), authentication = (frame["challenge"] as? JsonObject)?.let { value -> AuthenticationChallenge(value.text("provider"), value.optional("url"), value.optional("instructions"), value.optional("prompt"), value["secret"]?.jsonPrimitive?.booleanOrNull == true) }) }
                         "changed" -> scope.launch { reloadForSession(false, owner.files) }
                         "models_page" -> {
                             val response = pending[frame.text("id")]
                             if (response?.child === child && response.models != null) {
-                                val page = frame["models"] as? JsonArray ?: throw IOException("原生模型目录响应无效")
-                                for (value in page) response.models.add(decodeModel(value as? JsonObject ?: throw IOException("原生模型目录响应无效")))
+                                val page = frame["models"] as? JsonArray ?: throw OmpProtocolException("原生模型目录响应无效")
+                                for (value in page) response.models.add(decodeModel(value as? JsonObject ?: throw OmpProtocolException("原生模型目录响应无效")))
                             }
                         }
                         "host" -> scope.launch {
@@ -189,7 +196,6 @@ internal class OmpAgentManagementRepository(
                             catch (cancelled: CancellationException) { throw cancelled }
                             catch (failure: Exception) {
                                 if (nativeChild.get() === owner && !closed && !interrupted(owner)) {
-                                    reportFailure(owner)
                                     mutable.update { it.copy(loading = false, modelsLoading = false, error = "原生配置通信失效，请重新加载") }
                                 }
                                 stopOwned(owner)
@@ -209,13 +215,17 @@ internal class OmpAgentManagementRepository(
                 owner.intentional = true
                 throw cancelled
             } catch (error: Exception) {
-                failure = IOException("原生配置响应损坏，请重新加载")
+                failure = when (error) {
+                    is OmpProtocolException -> error
+                    is IOException -> OmpPipeException("原生配置管道读取失败：${ompIoDiagnostic(error)}，请重新加载")
+                    else -> IllegalStateException("原生配置事件处理失败（${error.javaClass.simpleName}），请重新加载")
+                }
             } finally {
                 val stopped = interrupted(owner) || closed
                 val reason = if (stopped) OmpProcessStoppedException()
                     else failure ?: IOException("原生配置进程已退出，请重新加载")
-                if (!stopped) reportFailure(owner)
                 if (nativeChild.compareAndSet(owner, null)) {
+                    if (!stopped && (failure == null || failure is OmpPipeException)) checkStartup(owner)
                     mutable.update { it.copy(loading = false, modelsLoading = false, authentication = null,
                         error = if (stopped) it.error else managementFailure(reason)) }
                 }
@@ -228,13 +238,13 @@ internal class OmpAgentManagementRepository(
         try {
             requestStarted("init", mapOf("workspace" to context.projectPath, "sessionId" to context.sessionId, "agentDir" to guestRoot), stopGeneration = stopGeneration)
         } catch (failure: Exception) {
-            stopOwned(owner)
+            if (failure !is OmpRpcTimeoutException) stopOwned(owner)
             throw failure
         }
     }
 
     private suspend fun requestStarted(op: String, args: Map<String, Any?> = emptyMap(), models: MutableList<ManagedModel>? = null,
-        stopGeneration: Long = currentStopGeneration()): JsonElement {
+        stopGeneration: Long = currentStopGeneration(), timeoutMs: Long = if (op == "generateAgent") 300_000 else rpcTiming.requestMs): JsonElement {
         val owner = nativeChild.get() ?: throw OmpProcessStoppedException()
         if (owner.stopGeneration != stopGeneration || interrupted(owner)) throw OmpProcessStoppedException()
         val child = owner.process
@@ -243,13 +253,11 @@ internal class OmpAgentManagementRepository(
         pending[id] = PendingRequest(child, result, models)
         try {
             send(child, buildJsonObject { put("id", id); put("op", op); put("args", args.element()) })
-            val response = withTimeoutOrNull(if (op == "generateAgent") 300_000 else 180_000) { result.await() }
+            val response = withTimeoutOrNull(timeoutMs) { result.await() }
                 ?: run {
                     if (runtime.wasInterrupted(context.containerId, stopGeneration)) throw OmpProcessStoppedException()
-                    // Model discovery, OAuth and agent generation may be waiting on a remote API.
-                    if (op == "init" || op == "snapshot" || op == "validateDocument") reportFailure(owner)
-                    stopOwned(owner)
-                    throw IllegalStateException("原生配置请求超时，请重新加载")
+                    if (op != "ping") probeAfterTimeout(owner)
+                    throw OmpRpcTimeoutException("原生配置 $op", timeoutMs)
                 }
             if (runtime.wasInterrupted(context.containerId, stopGeneration)) throw OmpProcessStoppedException()
             return response
@@ -258,9 +266,10 @@ internal class OmpAgentManagementRepository(
             stopOwned(owner)
             throw failure
         } catch (failure: IOException) {
-            val intentional = interrupted(owner)
-            if (!intentional) reportFailure(owner)
-            stopOwned(owner)
+            val intentional = interrupted(owner) && (owner.terminalFailure == null || !owner.files.isCurrent())
+            if (!intentional && failure is OmpPipeException && !failure.writeTimedOut) checkStartup(owner)
+            if (!intentional) mutable.update { it.copy(loading = false, modelsLoading = false, error = managementFailure(failure)) }
+            stopOwned(owner, if (intentional) OmpProcessStoppedException() else failure)
             if (intentional) throw OmpProcessStoppedException()
             throw failure
         } catch (failure: Exception) {
@@ -288,12 +297,10 @@ internal class OmpAgentManagementRepository(
             throw failure
         }
     }
-    private suspend fun send(child: Process, frame: JsonObject) = output.withLock {
-        withContext(Dispatchers.IO) {
+    private suspend fun send(child: Process, frame: JsonObject) {
+        writeOmpFrame(scope, output, child, frame.toString().toByteArray(Charsets.UTF_8), rpcTiming.writeMs) {
             val owner = nativeChild.get() ?: throw OmpProcessStoppedException()
             if (owner.process !== child || interrupted(owner)) throw OmpProcessStoppedException()
-            if (!child.isAlive) throw IOException("原生配置进程已退出，请重新加载")
-            child.outputStream.write((frame.toString() + "\n").toByteArray()); child.outputStream.flush()
         }
     }
 
@@ -332,7 +339,8 @@ internal class OmpAgentManagementRepository(
                 failure is OmpGuestFileException && failure.code == "CONFLICT" -> "CONFLICT: Configuration changed on disk; reload before saving"
                 failure.message == "Configuration changed on disk; reload before saving" -> "CONFLICT: Configuration changed on disk; reload before saving"
                 failure.message in setOf("Invalid configuration path", "Definition is outside the selected configuration scope") -> "UNAVAILABLE: Configuration path is outside the selected writable scope"
-                else -> "UNAVAILABLE: Cannot persist configuration or access the selected session capability"
+                failure is OmpGuestFileException -> "UNAVAILABLE: Native configuration storage failed: ${failure.code}: ${failure.guestPath}"
+                else -> "UNAVAILABLE: Cannot persist configuration or access the selected session capability (${failure.javaClass.simpleName})"
             }
         }
         send(child, buildJsonObject { put("id", frame.text("id")); put("hostResponse", true); if (failureMessage != null) put("error", failureMessage) else put("result", result.element()) })
@@ -611,21 +619,62 @@ internal class OmpAgentManagementRepository(
     private fun ManagedAdvisor.values() = mapOf("id" to id,"name" to name,"scope" to this.scope.name,"path" to path,"configuration" to configuration,"version" to version)
     private fun checkCatalogue(value: JsonObject, count: Int) {
         if (value["modelsCount"]?.jsonPrimitive?.intOrNull == count) return
-        nativeChild.get()?.let { owner -> reportFailure(owner); stopOwned(owner) }
+        nativeChild.get()?.let(::stopOwned)
         throw IOException("原生模型目录传输不完整，请重新加载")
     }
 
-    private fun reportFailure(owner: NativeChild) {
-        if (!closed && !interrupted(owner) && owner.reported.compareAndSet(false, true)) {
-            runtimeFailure(owner.stopGeneration, "容器中的 OMP 原生配置进程异常或通信失效，请在终端中修复")
+
+    private fun checkStartup(owner: NativeChild) {
+        if (interrupted(owner) || owner.liveness.hasReceivedFrame || !owner.startupCheck.compareAndSet(false, true)) return
+        checkStartup(owner.files, owner.launch, owner.park)
+    }
+
+    private fun checkStartup(files: OmpFileSession, launch: Long, park: Long) {
+        fun current() = !closed && !repairInProgress() && parkGeneration.get() == park && launchSequence.get() == launch && files.isCurrent()
+        scope.launch {
+            if (current() && OmpInstallation.needsRepair(runtime, context.containerId, files.stopGeneration, files.runGeneration) && current()) {
+                runtimeFailure(files.stopGeneration, OMP_REPAIR_NEEDED)
+            }
         }
     }
 
-    private fun stopOwned(owner: NativeChild) {
+    private fun probeAfterTimeout(owner: NativeChild) {
+        if (!owner.probing.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                while (nativeChild.get() === owner && !interrupted(owner)) {
+                    val observed = owner.liveness.probeStarted()
+                    try {
+                        requestStarted("ping", stopGeneration = owner.stopGeneration, timeoutMs = rpcTiming.probeMs)
+                        owner.liveness.answered()
+                        return@launch
+                    } catch (timeout: OmpRpcTimeoutException) {
+                        if (owner.liveness.timedOut(observed)) {
+                            val failure = OmpPipeException("原生配置通信失联：连续 3 次有界探测无有效响应（每次 ${rpcTiming.probeMs}ms），请重新加载")
+                            mutable.update { it.copy(loading = false, modelsLoading = false, error = failure.message) }
+                            stopOwned(owner, failure)
+                            return@launch
+                        }
+                    }
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                if (nativeChild.get() === owner && !interrupted(owner)) {
+                    mutable.update { it.copy(loading = false, modelsLoading = false, error = managementFailure(failure)) }
+                    stopOwned(owner, failure)
+                }
+            } finally { owner.probing.set(false) }
+        }
+    }
+
+    private fun stopOwned(owner: NativeChild) = stopOwned(owner, OmpProcessStoppedException())
+
+    private fun stopOwned(owner: NativeChild, failure: Throwable) {
+        owner.terminalFailure = failure.takeUnless { it is OmpProcessStoppedException }
         owner.intentional = true
         if (nativeChild.compareAndSet(owner, null)) mutable.update { it.copy(loading = false, modelsLoading = false) }
         pending.entries.forEach { (id, request) ->
-            if (request.child === owner.process && pending.remove(id, request)) request.result.completeExceptionally(OmpProcessStoppedException())
+            if (request.child === owner.process && pending.remove(id, request)) request.result.completeExceptionally(failure)
         }
         stop(owner.process)
     }
@@ -645,7 +694,7 @@ internal class OmpAgentManagementRepository(
         pending.values.forEach { it.result.cancel() }
         pending.clear()
     }
-    private fun stop(child: Process) { runCatching { child.outputStream.close() }; child.destroy(); if (!child.waitFor(2, TimeUnit.SECONDS)) { child.destroyForcibly(); child.waitFor(2, TimeUnit.SECONDS) }; runCatching { child.inputStream.close() }; runCatching { child.errorStream.close() } }
+    private fun stop(child: Process) { child.destroy(); if (!child.waitFor(2, TimeUnit.SECONDS)) { child.destroyForcibly(); child.waitFor(2, TimeUnit.SECONDS) }; runCatching { child.outputStream.close() }; runCatching { child.inputStream.close() }; runCatching { child.errorStream.close() } }
 }
 
 private fun JsonObject.text(key: String, default: String = "") = this[key]?.jsonPrimitive?.contentOrNull ?: default
@@ -667,14 +716,14 @@ internal fun readManagementFrames(input: InputStream, maxCharacters: Int = 4 * 1
         val buffer = CharArray(8192)
         val frame = StringBuilder(minOf(8192, maxCharacters))
         fun append(start: Int, end: Int) {
-            if (end - start > maxCharacters - frame.length) throw IOException("原生配置响应过大，请缩小配置后重新加载")
+            if (end - start > maxCharacters - frame.length) throw OmpProtocolException("原生配置响应过大，请缩小配置后重新加载")
             frame.append(buffer, start, end - start)
         }
         fun deliver() {
             if (frame.isNotEmpty()) {
                 val value = try { Json.parseToJsonElement(frame.toString()) as? JsonObject }
                 catch (_: Exception) { null }
-                if (value == null) throw IOException("原生配置响应无效，请重新加载")
+                if (value == null) throw OmpProtocolException("原生配置响应无效，请重新加载")
                 frame.setLength(0)
                 consume(value)
             }

@@ -118,6 +118,7 @@ async function validateModels(content, file = "models.yml") {
   return validateNativeModels(content, file);
 }
 async function dispatch(op,args) {
+  if(op==="ping")return true;
   if(op==="init"){ctx.cwd=args.workspace??null;ctx.sessionId=args.sessionId??null;ctx.agentDir=args.agentDir??ctx.agentDir;return true;}
   if(op==="snapshot") {
     const globalYml=path.join(ctx.agentDir,"config.yml"),globalYaml=path.join(ctx.agentDir,"config.yaml");

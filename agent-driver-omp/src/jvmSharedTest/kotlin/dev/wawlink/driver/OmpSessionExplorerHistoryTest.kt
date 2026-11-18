@@ -117,7 +117,7 @@ class OmpSessionExplorerHistoryTest {
         } finally { owner.cancel() }
     }
 
-    @Test fun fullTextSearchChecksNativeScopeAndHighlightBoundsWithoutLoadingDetails() = runBlocking {
+    @Test fun fullTextSearchChecksNativeScopeAndHighlightBoundsWithoutLoadingDetails() = runBlocking<Unit> {
         val owner = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
         var mode = "valid"
         try {

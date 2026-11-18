@@ -2,18 +2,12 @@
 # Trusted, bundled installer. OMP/Bun npm archives and the Alpine private glibc
 # runtime are pinned to publisher hashes; download selection never changes pins.
 set -eu
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# WAWLINK_GUEST_PACKAGES
 OMP_VERSION=18.12.6
 BUN_VERSION=1.3.14
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 progress() { printf '\n==> %s\n' "$*"; }
 exists() { [ -e "$1" ] || [ -L "$1" ]; }
-
-repair_dpkg() {
-    command -v dpkg >/dev/null 2>&1 || fail 'APT guest is missing dpkg'
-    progress 'Repairing any interrupted dpkg transaction'
-    DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-}
 
 # A real native import and RPC round trip, with no user configuration, model call,
 # credentials or extensions. The same probe gates both staged and published trees.
@@ -54,15 +48,18 @@ try {
     disabledProviders: ['ollama', 'llama.cpp', 'lm-studio', 'apple', 'local', 'web']
   }));
   const version = Bun.spawn(wrapper ? [wrapper, '--version'] : [process.execPath, tree + '/dist/cli.js', '--version'], { cwd: scratch, env, stdout: 'pipe', stderr: 'inherit' });
-  const versionTimer = setTimeout(() => version.kill('SIGKILL'), 20000);
+  let versionTimedOut = false;
+  const versionTimer = setTimeout(() => { versionTimedOut = true; version.kill('SIGKILL'); }, 20000);
   let text;
   let code;
   try { [text, code] = await Promise.all([new Response(version.stdout).text(), version.exited]); }
   finally { clearTimeout(versionTimer); }
+  if (versionTimedOut) throw Object.assign(new Error('OMP --version timed out after 20 seconds'), { code: 'ETIMEDOUT' });
   if (code !== 0 || !new RegExp('(^|[^0-9.])' + expectedOmp.replaceAll('.', '\\.') + '([^0-9.]|$)').test(text)) throw new Error('OMP --version failed: ' + text.trim());
   child = Bun.spawn([process.execPath, tree + '/dist/cli.js', '--mode', 'rpc-ui', '--provider', 'wawlink-install-check', '--model', 'wawlink-install-check/rpc-health', '--no-session', '--no-extensions', '--no-skills', '--no-rules', '--no-tools'],
     { cwd: scratch, env, stdin: 'pipe', stdout: 'pipe', stderr: 'inherit' });
-  const timer = setTimeout(() => child.kill('SIGKILL'), 45000);
+  let rpcTimedOut = false;
+  const timer = setTimeout(() => { rpcTimedOut = true; child.kill('SIGKILL'); }, 45000);
   let ready = false;
   let healthy = false;
   try {
@@ -91,7 +88,8 @@ try {
         }
       }
     }
-    if (!ready || !healthy) throw new Error('OMP RPC did not complete ready/get_state within 45 seconds');
+    if (rpcTimedOut) throw Object.assign(new Error('OMP RPC probe timed out after 45 seconds'), { code: 'ETIMEDOUT' });
+    if (!ready || !healthy) throw new Error('OMP RPC exited before ready/get_state completed');
   } finally {
     clearTimeout(timer);
     child.kill('SIGKILL');
@@ -102,18 +100,31 @@ try {
 } catch (error) {
   if (child) { child.kill('SIGKILL'); await child.exited; }
   console.error('Installation health check failed: ' + (error?.stack || error));
-  process.exit(1);
+  let environmentFailure = false;
+  for (let cause = error, depth = 0; cause && depth < 8; cause = cause.cause, depth++) {
+    if (['EACCES', 'EPERM', 'EROFS', 'ENOSPC', 'EDQUOT', 'EMFILE', 'ENFILE', 'ETIMEDOUT'].includes(cause.code)) environmentFailure = true;
+  }
+  process.exit(environmentFailure ? 75 : 1);
 }
 PROBE
 }
 
 if [ "${1:-}" = '--inspect' ]; then
+    for directory in /opt /usr /usr/local /usr/local/bin; do
+        if exists "$directory" && [ ! -x "$directory" ]; then fail "Installation check cannot traverse $directory (guest permissions)"; fi
+    done
+    if exists /opt/omp && [ ! -x /opt/omp ]; then fail 'Installation check cannot traverse /opt/omp (guest permissions)'; fi
     # Absence is established inside the guest, never inferred from a host path or
     # a container-engine exception. Partial installations are BROKEN, not MISSING.
     if ! exists /opt/omp && ! exists /usr/local/bin/omp && ! command -v omp >/dev/null 2>&1; then
         printf 'WAWLINK_OMP_CHECK\tMISSING\t客体未安装 OMP。\n'
         exit 0
     fi
+    for file in /usr/local/bin/bun /usr/local/bin/omp; do
+        if exists "$file" && { [ ! -r "$file" ] || [ ! -x "$file" ]; }; then fail "Installation check cannot read/execute $file (guest permissions)"; fi
+    done
+    if exists /opt/omp/dist && [ ! -x /opt/omp/dist ]; then fail 'Installation check cannot traverse /opt/omp/dist (guest permissions)'; fi
+    if exists /opt/omp/dist/cli.js && [ ! -r /opt/omp/dist/cli.js ]; then fail 'Installation check cannot read OMP CLI (guest permissions)'; fi
     if [ ! -x /usr/local/bin/bun ] || [ ! -f /opt/omp/dist/cli.js ] || [ ! -x /usr/local/bin/omp ]; then
         printf 'WAWLINK_OMP_CHECK\tBROKEN\tOMP 或 Bun 安装不完整，保留配置后可修复。\n'
         exit 0
@@ -127,12 +138,16 @@ if [ "${1:-}" = '--inspect' ]; then
     if /usr/local/bin/bun "$probe_dir/check.mjs" /opt/omp "$probe_dir/home" "$OMP_VERSION" "$BUN_VERSION" /usr/local/bin/omp > "$probe_dir/result" 2>&1; then
         printf 'WAWLINK_OMP_CHECK\tREADY\tOMP 18.12.6 / Bun 1.3.14 原生模块及 RPC 正常。\n'
     else
+        probe_status=$?
+        cat "$probe_dir/result" >&2
+        case "$probe_status" in 75|126) exit 75 ;; esac
         printf 'WAWLINK_OMP_CHECK\tBROKEN\tOMP / Bun 版本、原生模块或隔离 RPC 自检失败。\n'
     fi
     exit 0
 fi
 [ "$#" -eq 0 ] || fail 'Unknown installer argument'
-[ "$(id -u)" = 0 ] || fail 'Install/repair requires guest root. Select the container root user; host credentials are never copied.'
+wawlink_require_root || exit $?
+umask 0022
 [ "$(uname -s)" = Linux ] || fail 'Only Linux guests are supported'
 case "$(uname -m)" in
     aarch64|arm64) arch=aarch64 ;;
@@ -146,6 +161,13 @@ case "$ID" in ubuntu|debian|kali|alpine|arch|archarm|fedora) ;; *) fail "Unsuppo
 musl=0
 for loader in /lib/ld-musl-*.so.1; do if [ -f "$loader" ]; then musl=1; fi; done
 [ "$musl" -eq 0 ] || [ "$ID" = alpine ] || fail 'The private musl compatibility runtime is supported on Alpine only'
+# Serialize the whole repair, including system prerequisites. Never remove a
+# stale lock automatically: a killed installer may have left recovery files.
+mkdir -p -m755 /opt /usr /usr/local /usr/local/bin
+if ! mkdir /opt/.wawlink-omp-install.lock; then fail 'Another OMP repair is active, or an interrupted repair left /opt/.wawlink-omp-install.lock. Inspect its terminal and /opt/.wawlink-omp.* recovery files before removing the lock.'; fi
+trap 'rmdir /opt/.wawlink-omp-install.lock' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 source_mode=${WAWLINK_INSTALL_SOURCE:-}
 if [ -z "$source_mode" ] && [ -f /etc/wawlink-install-source ]; then
     IFS= read -r source_mode < /etc/wawlink-install-source || fail 'Cannot read installation source selection'
@@ -170,40 +192,11 @@ case "$arch" in
     x64) bun_asset=bun-linux-x64-baseline; triplet=x86_64-linux-gnu; runtime_loader=ld-linux-x86-64.so.2
         bun_sha=abff0474e0b4c9413c14f7a8395abcfcfc3923dfed25a62651f3bfb83500444c7c2149ce247d5127903706316aadef29bc9a22640f40a2f3c9ab916734d8d2c4 ;;
 esac
-# Minimal Debian/Ubuntu rootfs images do not contain a TLS trust store. Bootstrap
-# only ca-certificates through the same repositories over HTTP, keeping APT's
-# archive signatures and package hashes enabled. Never rewrite the user's sources
-# or disable TLS verification; all subsequent requests use the original sources.
-bootstrap_apt_certificates() (
-    ca_stage=$(mktemp -d /tmp/wawlink-omp-ca.XXXXXX)
-    trap 'rm -rf -- "$ca_stage"' 0
-    trap 'exit 130' INT
-    trap 'exit 143' TERM HUP
-    mkdir "$ca_stage/sources.list.d"
-    : > "$ca_stage/sources.list"
-    for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
-        [ -f "$source" ] || continue
-        case "$source" in
-            /etc/apt/sources.list) target="$ca_stage/sources.list" ;;
-            *) target="$ca_stage/sources.list.d/${source##*/}" ;;
-        esac
-        sed 's|https://|http://|g' "$source" > "$target"
-    done
-    set -- -o "Dir::Etc::sourcelist=$ca_stage/sources.list" -o "Dir::Etc::sourceparts=$ca_stage/sources.list.d" -o APT::Update::Error-Mode=any
-    apt-get "$@" update
-    apt-get "$@" install -y --no-install-recommends ca-certificates
-)
 
 progress "Installing $ID $VERSION_ID prerequisites ($source_mode downloads)"
 case "$ID" in
     ubuntu|debian|kali)
-        export DEBIAN_FRONTEND=noninteractive
-        repair_dpkg
-        if [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
-            progress 'Bootstrapping CA certificates with signed distribution packages'
-            bootstrap_apt_certificates
-        fi
-        apt-get -o APT::Update::Error-Mode=any update
+        wawlink_prepare_apt
         apt-get install -y --no-install-recommends ca-certificates curl tar gzip coreutils git ripgrep jq xz-utils zstd libatomic1 libstdc++6 python3 build-essential pkg-config nodejs npm
         ;;
     alpine)
@@ -232,13 +225,11 @@ esac
 for tool in curl tar sha256sum sha512sum mktemp install node npm; do
     command -v "$tool" >/dev/null 2>&1 || fail "Missing required guest command: $tool"
 done
-mkdir -p /opt /usr/local/bin
 [ ! -L /opt/omp ] || fail '/opt/omp is a symlink; refusing to replace an unknown installation target'
 [ ! -e /opt/omp ] || [ -d /opt/omp ] || fail '/opt/omp exists but is not a directory'
 # Each replacement and its backup live on the destination filesystem. Never
 # remove rootfs, .omp, workspaces, authentication, configuration or session data.
-if ! mkdir /opt/.wawlink-omp-install.lock; then fail 'Another OMP repair is active, or an interrupted repair left /opt/.wawlink-omp-install.lock. Inspect its terminal before removing that lock.'; fi
-trap 'rmdir /opt/.wawlink-omp-install.lock' 0
+umask 0077
 stage=$(mktemp -d /opt/.wawlink-omp.XXXXXX)
 bin_stage=''
 publish_started=0
@@ -291,7 +282,7 @@ trap 'exit 143' TERM HUP
 bin_stage=$(mktemp -d /usr/local/bin/.wawlink-omp.XXXXXX)
 fetch() {
     url=$1 destination=$2 checksum=$3 algorithm=$4
-    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --connect-timeout 30 --output "$destination.part" "$url"
+    curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --retry-max-time 900 --max-time 600 --speed-limit 1024 --speed-time 60 --connect-timeout 30 --output "$destination.part" "$url"
     printf '%s  %s\n' "$checksum" "$destination.part" | "$algorithm" --check -
     mv "$destination.part" "$destination"
 }
@@ -380,6 +371,10 @@ exec /usr/local/bin/bun /opt/omp/dist/cli.js "$@"
 WRAPPER
 chmod 755 "$bin_stage/omp"
 ln -s bun "$bin_stage/bunx"
+# npm and archive extraction inherit our private umask. Only the validated
+# executable payload becomes public; staging, probe HOME and backups stay 700.
+find "$stage/omp" -type d -exec chmod 755 {} +
+find "$stage/omp" -type f -exec chmod a+rX {} +
 progress 'Switching validated installation (previous files retained until final check)'
 if [ "$musl" -eq 1 ]; then
     runtime=/opt/omp/.wawlink-runtime
